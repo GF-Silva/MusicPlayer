@@ -66,6 +66,8 @@
 #define PIN_NUM_CLK  18
 #define PIN_NUM_CS   4
 #define MOUNT_POINT "/sdcard"
+#define BOARD_LED_GPIO 2
+#define BOARD_LED_ACTIVE_HIGH 1
 
 // Pinos de controle de volume
 #define PIN_VOL_UP   21
@@ -74,7 +76,10 @@
 #define DEBOUNCE_TIME_MS 50
 #define VOLUME_STEP 5
 #define POWER_HOLD_MS 2000
-#define AUTO_SLEEP_IDLE_MS (8 * 60 * 1000)  // 8 min sem BT/áudio -> deep sleep
+#define AUTO_SLEEP_IDLE_MS (1 * 60 * 1000)  // 1 min sem BT/áudio -> deep sleep
+#define BT_CONNECTING_STUCK_MS (90 * 1000)  // destrava estado "conectando" preso
+#define A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD 3
+#define PWR_RELEASE_WAIT_MS 5000
 
 #define DOUBLE_CLICK_INTERVAL_MS 300
 #define LONG_CLICK_THRESHOLD_MS 400
@@ -95,6 +100,7 @@
 #define MP3_READ_MAX          16384
 
 #define MP3_CRITICAL_BYTES    4096
+#define MP3_NO_SYNC_DROP_BYTES 512
 #define PREBUFFER_FRAMES      10
 
 #define STREAM_REFILL_THRESHOLD   (STREAM_BUFFER_SIZE / 4)
@@ -191,6 +197,20 @@ static uint32_t buffer_low_events = 0;
 static uint32_t buffer_high_events = 0;
 static TickType_t last_producer_tick = 0;
 static bool playback_paused = false;
+static TickType_t bt_connecting_since = 0;
+static uint32_t a2dp_open_fail_streak = 0;
+
+static void set_bt_connecting(bool connecting)
+{
+    if (connecting) {
+        if (!sys_status.bt_connecting) {
+            bt_connecting_since = xTaskGetTickCount();
+        }
+    } else {
+        bt_connecting_since = 0;
+    }
+    sys_status.bt_connecting = connecting;
+}
 
 static bool bt_ready_for_playback(void)
 {
@@ -225,6 +245,7 @@ static volatile bool cmd_retry_pending = false;
 static volatile bool cmd_restart_disc_pending = false;
 static volatile bool cmd_connect_pending = false;
 static bool discovery_stop_pending = false;
+static volatile bool restart_discovery_in_progress = false;
 
 static const char *cmd_to_str(player_cmd_t cmd)
 {
@@ -495,6 +516,31 @@ static int skip_id3v2(FILE *f)
     
     fseek(f, 0, SEEK_SET);
     return 0;
+}
+
+static bool drop_trailing_tag_if_present(uint8_t **ptr, int *bytes_left)
+{
+    if (!ptr || !*ptr || !bytes_left || *bytes_left <= 0) {
+        return false;
+    }
+
+    /* ID3v1 tail: 128 bytes starting with "TAG". */
+    if (*bytes_left >= 128 && memcmp(*ptr, "TAG", 3) == 0) {
+        ESP_LOGI(TAG, "🏁 Detectado ID3v1 no final (%d bytes restantes), encerrando track", *bytes_left);
+        *ptr += *bytes_left;
+        *bytes_left = 0;
+        return true;
+    }
+
+    /* APEv2 footer/header marker. */
+    if (*bytes_left >= 32 && memcmp(*ptr, "APETAGEX", 8) == 0) {
+        ESP_LOGI(TAG, "🏁 Detectado APE tag no final (%d bytes restantes), encerrando track", *bytes_left);
+        *ptr += *bytes_left;
+        *bytes_left = 0;
+        return true;
+    }
+
+    return false;
 }
 
 // ============================================================================
@@ -1157,10 +1203,29 @@ static void decode_and_stream(void *pvParameter)
         // -----------------------------
         int offset = MP3FindSyncWord(read_ptr, bytes_left_in_mp3);
         if (offset < 0) {
+            if (feof(current_file) && drop_trailing_tag_if_present(&read_ptr, &bytes_left_in_mp3)) {
+                reached_eof = true;
+                break;
+            }
+
             if (feof(current_file)) {
                 eof_no_sync_loops++;
             } else {
                 eof_no_sync_loops = 0;
+            }
+
+            /* Evita loop preso com lixo no buffer (ex.: tag de cauda) sem chegar no EOF. */
+            if (!feof(current_file) && bytes_left_in_mp3 > MP3_CRITICAL_BYTES) {
+                int drop = bytes_left_in_mp3 - MP3_CRITICAL_BYTES;
+                if (drop > MP3_NO_SYNC_DROP_BYTES) {
+                    drop = MP3_NO_SYNC_DROP_BYTES;
+                }
+                if (drop > 0) {
+                    read_ptr += drop;
+                    bytes_left_in_mp3 -= drop;
+                    vTaskDelay(1);
+                    continue;
+                }
             }
 
             if (feof(current_file) &&
@@ -1187,6 +1252,10 @@ static void decode_and_stream(void *pvParameter)
         if (err != ERR_MP3_NONE) {
             if (feof(current_file)) {
                 eof_decode_err_loops++;
+                if (drop_trailing_tag_if_present(&read_ptr, &bytes_left_in_mp3)) {
+                    reached_eof = true;
+                    break;
+                }
             } else {
                 eof_decode_err_loops = 0;
             }
@@ -1381,15 +1450,69 @@ static void configure_deep_sleep_wakeup(void)
     }
 }
 
-static void enter_deep_sleep(void)
+static void set_power_led(bool on)
+{
+    int level = on ? (BOARD_LED_ACTIVE_HIGH ? 1 : 0)
+                   : (BOARD_LED_ACTIVE_HIGH ? 0 : 1);
+
+    // Se veio de deep sleep com hold ativo, libera antes de reconfigurar.
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)BOARD_LED_GPIO)) {
+        rtc_gpio_hold_dis((gpio_num_t)BOARD_LED_GPIO);
+        rtc_gpio_deinit((gpio_num_t)BOARD_LED_GPIO);
+    }
+
+    gpio_reset_pin((gpio_num_t)BOARD_LED_GPIO);
+    gpio_set_direction((gpio_num_t)BOARD_LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)BOARD_LED_GPIO, level);
+}
+
+static bool wait_wakeup_pin_inactive(uint32_t timeout_ms)
+{
+    if (gpio_get_level(PIN_PWR_SLEEP) != 0) {
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Botão wake ainda pressionado, aguardando soltar...");
+    TickType_t start = xTaskGetTickCount();
+    while (gpio_get_level(PIN_PWR_SLEEP) == 0) {
+        if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(timeout_ms)) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    // Debounce de soltura antes de dormir.
+    vTaskDelay(pdMS_TO_TICKS(80));
+    return true;
+}
+
+static void enter_deep_sleep(bool from_power_button)
 {
     ESP_LOGW(TAG, "😴 Entrando em deep sleep (hold power button)");
+
+    uint32_t wait_ms = from_power_button ? PWR_RELEASE_WAIT_MS : 600;
+    if (!wait_wakeup_pin_inactive(wait_ms)) {
+        ESP_LOGW(TAG, "Deep sleep cancelado: botão wake permaneceu LOW");
+        return;
+    }
+
     stop_playback_and_reset(true, "deep_sleep");
     free_mp3_playlist_cache();
 
     if (connection_timer) xTimerStop(connection_timer, 0);
     if (discovery_timer) xTimerStop(discovery_timer, 0);
     if (buffer_monitor_timer) xTimerStop(buffer_monitor_timer, 0);
+
+    // Apaga LED "power" de software e mantém estado durante deep sleep.
+    if (rtc_gpio_is_valid_gpio((gpio_num_t)BOARD_LED_GPIO)) {
+        rtc_gpio_deinit((gpio_num_t)BOARD_LED_GPIO);
+        rtc_gpio_init((gpio_num_t)BOARD_LED_GPIO);
+        rtc_gpio_set_direction((gpio_num_t)BOARD_LED_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level((gpio_num_t)BOARD_LED_GPIO, BOARD_LED_ACTIVE_HIGH ? 0 : 1);
+        rtc_gpio_pullup_dis((gpio_num_t)BOARD_LED_GPIO);
+        rtc_gpio_pulldown_dis((gpio_num_t)BOARD_LED_GPIO);
+        rtc_gpio_hold_en((gpio_num_t)BOARD_LED_GPIO);
+    }
 
     configure_deep_sleep_wakeup();
     vTaskDelay(pdMS_TO_TICKS(80));
@@ -1468,7 +1591,7 @@ static void volume_control_task(void *pvParameter)
             (now - pwr_press_start_time) > pdMS_TO_TICKS(POWER_HOLD_MS)) {
             pwr_hold_handled = true;
             ESP_LOGW(TAG, "⏻ Power hold detectado (%d ms)", POWER_HOLD_MS);
-            enter_deep_sleep();
+            enter_deep_sleep(true);
         }
         
         if (vol_up_btn.click_count > 0 && 
@@ -1546,7 +1669,7 @@ static void connection_timeout_callback(TimerHandle_t xTimer)
     ESP_LOGW(TAG, "⏱️ Timeout de conexão BT");
     log_bt_state("conn_timeout");
     if (!sys_status.bt_connected && sys_status.bt_connecting) {
-        sys_status.bt_connecting = false;
+        set_bt_connecting(false);
         player_cmd_t cmd = CMD_RETRY_CONNECTION;
         enqueue_control_cmd(cmd);
     }
@@ -1557,6 +1680,9 @@ static void discovery_timeout_callback(TimerHandle_t xTimer)
     ESP_LOGW(TAG, "⏱️ Timeout de discovery");
     log_bt_state("disc_timeout");
     if (!device_found && !sys_status.bt_connected && sys_status.bt_connecting) {
+        // Se o discovery estourou tempo e não encontrou alvo, libera estado de conexão
+        // para permitir novo ciclo de busca.
+        set_bt_connecting(false);
         player_cmd_t cmd = CMD_RESTART_DISCOVERY;
         enqueue_control_cmd(cmd);
     }
@@ -1616,6 +1742,11 @@ static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *par
                 }
                 discovery_active = false;
                 discovery_stop_pending = false;
+                // Discovery parou sem alvo e sem conexão em progresso real:
+                // destrava "connecting" para não bloquear novos retries.
+                if (!sys_status.bt_connected && !connect_after_discovery_stop) {
+                    set_bt_connecting(false);
+                }
                 log_bt_state("disc_stopped");
                 if (connect_after_discovery_stop && device_found && !sys_status.bt_connected) {
                     connect_after_discovery_stop = false;
@@ -1655,8 +1786,9 @@ static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             
             if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
                 ESP_LOGI(TAG, "✅ A2DP conectado!");
-                sys_status.bt_connecting = false;
+                set_bt_connecting(false);
                 connect_after_discovery_stop = false;
+                a2dp_open_fail_streak = 0;
                 
                 if (connection_timer) {
                     xTimerStop(connection_timer, 0);
@@ -1683,9 +1815,22 @@ static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 log_bt_state("a2dp_connected");
             } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 ESP_LOGW(TAG, "⚠️ A2DP desconectado");
+                bool had_stream_progress = sys_status.audio_playing ||
+                                           sys_status.streaming_active ||
+                                           (total_bytes_streamed > 0) ||
+                                           (callback_count > 0);
+                if (!had_stream_progress) {
+                    if (a2dp_open_fail_streak < UINT32_MAX) {
+                        a2dp_open_fail_streak++;
+                    }
+                } else {
+                    a2dp_open_fail_streak = 0;
+                }
+                ESP_LOGW(TAG, "A2DP fail streak: %lu", (unsigned long)a2dp_open_fail_streak);
+
                 sys_status.bt_connected = false;
                 sys_status.streaming_active = false;
-                sys_status.bt_connecting = false;
+                set_bt_connecting(false);
                 connect_after_discovery_stop = false;
                 xEventGroupClearBits(player_event_group, BT_CONNECTED_BIT);
                 xEventGroupClearBits(player_event_group, STREAM_READY_BIT);
@@ -1694,7 +1839,11 @@ static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 player_cmd_t stop_cmd = CMD_STOP;
                 enqueue_control_cmd(stop_cmd);
 
-                if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
+                if (a2dp_open_fail_streak >= A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD) {
+                    ESP_LOGW(TAG, "Falhas seguidas de abertura A2DP, forçando novo discovery");
+                    player_cmd_t restart_cmd = CMD_RESTART_DISCOVERY;
+                    enqueue_control_cmd(restart_cmd);
+                } else {
                     player_cmd_t retry_cmd = CMD_RETRY_CONNECTION;
                     enqueue_control_cmd(retry_cmd);
                 }
@@ -1880,7 +2029,7 @@ static esp_err_t bluetooth_search_and_connect(void)
     device_found = false;
     connect_after_discovery_stop = false;
     discovery_stop_pending = false;
-    sys_status.bt_connecting = true;
+    set_bt_connecting(true);
     
     esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
     
@@ -1949,6 +2098,7 @@ static void player_control_task(void *pvParameter)
                     cmd_retry_pending = false;
                     break;
                 case CMD_RESTART_DISCOVERY:
+                    restart_discovery_in_progress = false;
                     cmd_restart_disc_pending = false;
                     break;
                 case CMD_CONNECT_TARGET:
@@ -2031,33 +2181,51 @@ static void player_control_task(void *pvParameter)
                         break;
                     }
                     ESP_LOGI(TAG, "🔄 Comando: RETRY_CONNECTION");
-                    
-                    if ((sys_status.connection_retries + 1) < CONNECTION_RETRY_MAX) {
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                        if (sys_status.bt_connected || sys_status.bt_connecting) {
-                            break;
-                        }
-                        sys_status.connection_retries++;
 
-                        // Primeiro tenta conexão direta no MAC conhecido para evitar race de discovery.
-                        memcpy(target_device_addr, target_mac_addr, ESP_BD_ADDR_LEN);
-                        device_found = true;
-                        sys_status.bt_connecting = true;
-                        connect_after_discovery_stop = false;
-                        player_cmd_t conn_cmd = CMD_CONNECT_TARGET;
-                        if (!enqueue_control_cmd(conn_cmd)) {
-                            // Se já houver connect pendente, não abrir discovery em paralelo.
-                            // Discovery fica como fallback quando timeout ocorrer.
-                        }
-                    } else {
-                        ESP_LOGE(TAG, "❌ Máximo de tentativas");
-                        xEventGroupSetBits(player_event_group, ERROR_BIT);
+                    if (a2dp_open_fail_streak >= A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD) {
+                        ESP_LOGW(TAG, "RETRY_CONNECTION -> RESTART_DISCOVERY (fail streak=%lu)",
+                                 (unsigned long)a2dp_open_fail_streak);
+                        player_cmd_t redisc = CMD_RESTART_DISCOVERY;
+                        enqueue_control_cmd(redisc);
+                        break;
+                    }
+
+                    uint32_t retry_delay_ms = 1200 + (a2dp_open_fail_streak * 800);
+                    if (retry_delay_ms > 4000) retry_delay_ms = 4000;
+                    vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+                    if (sys_status.bt_connected || sys_status.bt_connecting) {
+                        break;
+                    }
+                    if (sys_status.connection_retries < INT_MAX) {
+                        sys_status.connection_retries++;
+                    }
+
+                    // Primeiro tenta conexão direta no MAC conhecido para evitar race de discovery.
+                    memcpy(target_device_addr, target_mac_addr, ESP_BD_ADDR_LEN);
+                    device_found = true;
+                    set_bt_connecting(true);
+                    connect_after_discovery_stop = false;
+                    player_cmd_t conn_cmd = CMD_CONNECT_TARGET;
+                    if (!enqueue_control_cmd(conn_cmd)) {
+                        // Se já houver connect pendente, não abrir discovery em paralelo.
+                        // Discovery fica como fallback quando timeout ocorrer.
                     }
                     break;
                 
                 case CMD_RESTART_DISCOVERY:
-                    if (sys_status.bt_connected || sys_status.bt_connecting) {
-                        ESP_LOGI(TAG, "RESTART_DISCOVERY ignorado: já conectado/conectando");
+                    restart_discovery_in_progress = true;
+                    if (sys_status.bt_connected) {
+                        ESP_LOGI(TAG, "RESTART_DISCOVERY ignorado: já conectado");
+                        restart_discovery_in_progress = false;
+                        break;
+                    }
+                    // Permite reiniciar busca mesmo se "connecting" ficou preso sem discovery ativo.
+                    if (sys_status.bt_connecting && !discovery_active) {
+                        ESP_LOGW(TAG, "RESTART_DISCOVERY: limpando connecting preso");
+                        set_bt_connecting(false);
+                    }
+                    if (sys_status.bt_connecting && discovery_active) {
+                        ESP_LOGI(TAG, "RESTART_DISCOVERY ignorado: discovery em andamento");
                         break;
                     }
                     ESP_LOGI(TAG, "🔄 Comando: RESTART_DISCOVERY");
@@ -2065,6 +2233,7 @@ static void player_control_task(void *pvParameter)
                     device_found = false;
                     vTaskDelay(pdMS_TO_TICKS(1000));
                     bluetooth_search_and_connect();
+                    restart_discovery_in_progress = false;
                     break;
 
                 case CMD_CONNECT_TARGET: {
@@ -2086,12 +2255,12 @@ static void player_control_task(void *pvParameter)
                     if (connection_timer) {
                         xTimerStop(connection_timer, 0);
                     }
-                    sys_status.bt_connecting = true;
+                    set_bt_connecting(true);
                     esp_err_t conn_err = esp_a2d_source_connect(target_device_addr);
                     if (conn_err != ESP_OK) {
                         ESP_LOGE(TAG, "❌ Falha connect: %s", esp_err_to_name(conn_err));
                         device_found = false;
-                        sys_status.bt_connecting = false;
+                        set_bt_connecting(false);
                     } else {
                         ESP_LOGI(TAG, "✅ Comando connect enviado");
                         if (connection_timer) {
@@ -2159,41 +2328,18 @@ static void main_task(void *pvParameter)
     ESP_LOGI(TAG, "Task principal iniciada");
     ESP_LOGI(TAG, "Aguardando conexão Bluetooth...");
     
-    EventBits_t bits = xEventGroupWaitBits(player_event_group, 
-                                          BT_CONNECTED_BIT | ERROR_BIT, 
-                                          false, false, 
+    EventBits_t bits = xEventGroupWaitBits(player_event_group,
+                                          BT_CONNECTED_BIT,
+                                          false, false,
                                           pdMS_TO_TICKS(60000));
-    
-    if (bits & ERROR_BIT) {
-        ESP_LOGE(TAG, "Erro crítico detectado, reiniciando...");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_restart();
-        return;
-    }
-    
     if (!(bits & BT_CONNECTED_BIT)) {
-        ESP_LOGE(TAG, "Timeout de conexão Bluetooth");
-        log_system_status();
-        
-        if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
-            player_cmd_t cmd = CMD_RETRY_CONNECTION;
-            enqueue_control_cmd(cmd);
-            
-            bits = xEventGroupWaitBits(player_event_group, BT_CONNECTED_BIT, 
-                                     false, true, pdMS_TO_TICKS(30000));
-            
-            if (!(bits & BT_CONNECTED_BIT)) {
-                ESP_LOGE(TAG, "Falha final de conexão, reiniciando...");
-                esp_restart();
-                return;
-            }
-        } else {
-            ESP_LOGE(TAG, "Falha definitiva de conexão");
-            return;
-        }
+        ESP_LOGW(TAG, "Sem conexão inicial em 60s, mantendo retries contínuos...");
+        player_cmd_t cmd = CMD_RETRY_CONNECTION;
+        enqueue_control_cmd(cmd);
+        ESP_LOGI(TAG, "Sistema iniciado sem BT (modo reconexão contínua).");
+    } else {
+        ESP_LOGI(TAG, "Bluetooth conectado! Sistema pronto.");
     }
-    
-    ESP_LOGI(TAG, "Bluetooth conectado! Sistema pronto.");
     vTaskDelay(pdMS_TO_TICKS(2000));
     
     log_system_status();
@@ -2214,23 +2360,38 @@ static void main_task(void *pvParameter)
             last_alive_log = xTaskGetTickCount();
         }
         
-        if (!sys_status.bt_connected && !sys_status.audio_playing && 
-            !sys_status.bt_connecting) {
+        if (!sys_status.bt_connected && !sys_status.audio_playing) {
             if (idle_without_bt_start == 0) {
                 idle_without_bt_start = xTaskGetTickCount();
             }
-
-            if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
+            if (!sys_status.bt_connecting &&
+                !cmd_retry_pending &&
+                !cmd_restart_disc_pending &&
+                !cmd_connect_pending &&
+                !restart_discovery_in_progress &&
+                !discovery_active &&
+                !discovery_stop_pending) {
                 ESP_LOGW(TAG, "Conexão perdida (sem música), tentando reconectar...");
                 player_cmd_t cmd = CMD_RETRY_CONNECTION;
                 enqueue_control_cmd(cmd);
+            }
+
+            if (sys_status.bt_connecting && bt_connecting_since != 0) {
+                TickType_t connecting_ticks = xTaskGetTickCount() - bt_connecting_since;
+                if (connecting_ticks > pdMS_TO_TICKS(BT_CONNECTING_STUCK_MS)) {
+                    ESP_LOGW(TAG, "⚠️ bt_connecting preso por %lu ms, reiniciando ciclo",
+                             (unsigned long)TICKS_TO_MS(connecting_ticks));
+                    set_bt_connecting(false);
+                    player_cmd_t cmd = CMD_RESTART_DISCOVERY;
+                    enqueue_control_cmd(cmd);
+                }
             }
 
             TickType_t idle_ticks = xTaskGetTickCount() - idle_without_bt_start;
             if (idle_ticks > pdMS_TO_TICKS(AUTO_SLEEP_IDLE_MS)) {
                 ESP_LOGW(TAG, "⏲️ Auto-sleep: %lu ms sem BT/áudio",
                         (unsigned long)TICKS_TO_MS(idle_ticks));
-                enter_deep_sleep();
+                enter_deep_sleep(false);
             }
         } else {
             idle_without_bt_start = 0;
@@ -2248,6 +2409,9 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "===== ESP32 MP3 Player - CORREÇÕES FINAIS =====");
     ESP_LOGI(TAG, "Heap inicial: %lu bytes", (unsigned long)esp_get_free_heap_size());
+
+    // LED azul (GPIO2) como indicador principal de "ligado".
+    set_power_led(true);
 
     esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     if (wake == ESP_SLEEP_WAKEUP_EXT0) {
