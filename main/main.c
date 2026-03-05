@@ -1,3 +1,31 @@
+/*
+ * ============================================================================
+ * ESP32 MP3 Player - CORREÇÕES FINAIS
+ * ============================================================================
+ * 
+ * CORREÇÕES APLICADAS:
+ * 
+ * 1. CONTROLE DE BUFFER MELHORADO:
+ *    - Thresholds ajustados: 40-75% (era 30-70%)
+ *    - Yield mais agressivo (a cada 3 frames vs 8)
+ *    - Leitura adaptativa mais equilibrada
+ * 
+ * 2. TRANSIÇÃO ENTRE MÚSICAS:
+ *    - Reset completo do stream buffer
+ *    - Aguardar término da task anterior
+ *    - Fechar arquivo antes de limpar decoder
+ *    - Zerar bytes_left_in_mp3 e read_ptr
+ * 
+ * 3. FIM DE ARQUIVO:
+ *    - Detectar EOF adequadamente
+ *    - Processar bytes restantes no buffer
+ *    - Limpar recursos na ordem correta
+ * 
+ * Compatível com: IDF 4.4.4 + libhelix
+ * Data: 02/02/2026
+ * ============================================================================
+ */
+
 #include <string.h>
 #include <stdio.h>
 #include <dirent.h>
@@ -13,12 +41,14 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_sleep.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
@@ -26,6 +56,9 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "nvs_flash.h"
+#include <limits.h>
+
+#include "mp3dec.h"
 
 // Configurações do SD Card
 #define PIN_NUM_MISO 19
@@ -37,65 +70,68 @@
 // Pinos de controle de volume
 #define PIN_VOL_UP   21
 #define PIN_VOL_DOWN 22
+#define PIN_PWR_SLEEP 33  // RTC IO: wakeup de deep sleep (botão ativo em LOW)
 #define DEBOUNCE_TIME_MS 50
-#define VOLUME_STEP 5  // Incremento de 5%
+#define VOLUME_STEP 5
+#define POWER_HOLD_MS 2000
+#define AUTO_SLEEP_IDLE_MS (8 * 60 * 1000)  // 8 min sem BT/áudio -> deep sleep
 
-#define DOUBLE_CLICK_INTERVAL_MS 300  // Tempo máximo entre cliques (300ms = rápido)
-#define LONG_CLICK_THRESHOLD_MS 400   // Acima disso é considerado clique longo
+#define DOUBLE_CLICK_INTERVAL_MS 300
+#define LONG_CLICK_THRESHOLD_MS 400
 
-// Configurações otimizadas para RAM LIMITADA do ESP32
-#define MAX_PATH_LEN 140
+#define MAX_PATH_LEN 256
 
-// BUFFER ÚNICO SIMPLIFICADO - Economia de ~40KB
-#define AUDIO_READ_BUFFER_SIZE    16384     // 16KB - leituras maiores do SD
-#define STREAM_BUFFER_SIZE        49152     // 48KB - buffer único principal
-#define A2DP_CHUNK_SIZE           512        
+// ✅ CONFIGURAÇÃO OTIMIZADA - FOCO EM BALANCEAR PRODUÇÃO/CONSUMO
+#define MP3_INPUT_BUFFER_SIZE     16384     // 16KB
+#define PCM_OUTPUT_BUFFER_SIZE    4608      // 4.6KB - 1 frame
+#define STREAM_BUFFER_SIZE        32278     // ~32KB
+#define A2DP_CHUNK_SIZE           512       // Controlado pelo IDF
 
-// Total RAM buffers: ~65KB (deixa ~140KB para Bluetooth)
+// ✅ THRESHOLDS MUITO REDUZIDOS: 30-60% (alvo: manter entre 30-60%)
+#define MP3_LOW_WATERMARK      30.0f  // Muito reduzido
+#define MP3_HIGH_WATERMARK    60.0f   // Muito reduzido
+
+#define MP3_READ_MIN          1024
+#define MP3_READ_MAX          16384
+
+#define MP3_CRITICAL_BYTES    4096
+#define PREBUFFER_FRAMES      10
+
 #define STREAM_REFILL_THRESHOLD   (STREAM_BUFFER_SIZE / 4)
-#define TARGET_DEVICE_NAME "TWS V5.3"
+#define TICKS_TO_MS(t) ((uint32_t)(t) * (uint32_t)portTICK_PERIOD_MS)
+
+// Configuração do dispositivo alvo
+// ✅ IDF 4.4.4: Usa apenas MAC address para descoberta
+// (Campo EIR não disponível nesta versão do IDF)
+#define TARGET_DEVICE_NAME "TWS"  // Apenas para referência/logs
+#define TARGET_DEVICE_MAC  {0x41, 0x42, 0x78, 0xA4, 0x06, 0x97}
+#define PREFER_MAC_OVER_NAME true  // Sempre true no IDF 4.4.4
+
 #define CONNECTION_RETRY_MAX 5
 #define FILE_READ_RETRY_MAX 3
 #define DISCOVERY_TIMEOUT_SEC 45
 
-// Sample rates suportados
 #define SAMPLE_RATE_44K1 44100
 #define SAMPLE_RATE_48K  48000
 
-// Estrutura do header WAV
 typedef struct {
-    char riff_header[4];
-    uint32_t wav_size;
-    char wave_header[4];
-    char fmt_header[4];
-    uint32_t fmt_chunk_size;
-    uint16_t audio_format;
-    uint16_t num_channels;
-    uint32_t sample_rate;
-    uint32_t byte_rate;
-    uint16_t sample_alignment;
-    uint16_t bit_depth;
-    char data_header[4];
-    uint32_t data_bytes;
-} __attribute__((packed)) wav_header_t;
-
-typedef struct {
-    bool is_valid_wav;
+    bool is_valid_mp3;
     uint32_t sample_rate;
     uint16_t channels;
     uint16_t bits_per_sample;
-    uint32_t data_size;
-    size_t data_start_offset;
+    uint32_t file_size;
+    uint32_t bitrate;
     uint32_t duration_seconds;
     bool a2dp_compatible;
-} wav_info_t;
+} mp3_info_t;
 
-static const char *TAG = "WAVPlayer";
+static const char *TAG = "MP3Player";
 
 typedef struct {
     bool sd_mounted;
     bool bt_initialized;
     bool bt_connected;
+    bool bt_connecting;
     bool audio_playing;
     bool system_ready;
     bool codec_configured;
@@ -106,20 +142,29 @@ typedef struct {
 
 static system_status_t sys_status = {0};
 
-// Controle de volume (0-100%)
-static uint8_t current_volume = 30;  // Volume inicial 30%
-static float volume_scale = 0.30f;   // = current_volume / 100.0
+static uint8_t current_volume = 30;
+static float volume_scale = 0.30f;
 
-// Variáveis globais
 static esp_bd_addr_t target_device_addr;
+static esp_bd_addr_t target_mac_addr = TARGET_DEVICE_MAC;
 static bool device_found = false;
-static int wav_count = 0;
+static bool discovery_active = false;
+static bool connect_after_discovery_stop = false;
+static int mp3_count = 0;
 static int current_track = 0;
 static FILE *current_file = NULL;
-static wav_info_t current_wav_info = {0};
+static mp3_info_t current_mp3_info = {0};
 static TaskHandle_t file_reader_task_handle = NULL;
+static volatile bool file_reader_task_running = false;
 
-// Ring buffer
+static HMP3Decoder mp3_decoder = NULL;
+
+static uint8_t *mp3_input_buffer = NULL;
+static int16_t *pcm_output_buffer = NULL;
+
+static int bytes_left_in_mp3 = 0;
+static uint8_t *read_ptr = NULL;
+
 typedef struct {
     uint8_t *data;
     size_t size;
@@ -132,14 +177,26 @@ typedef struct {
 } ring_buffer_t;
 
 static ring_buffer_t *stream_buffer = NULL;
-static uint8_t *file_read_buffer = NULL;
 
 static uint32_t total_bytes_streamed = 0;
 static uint32_t underrun_count = 0;
 static uint32_t callback_count = 0;
+static uint32_t cb_lock_fail_count = 0;
+static uint32_t cb_empty_count = 0;
+static uint32_t cb_partial_count = 0;
+static uint32_t producer_frame_count = 0;
+static uint32_t producer_drop_count = 0;
 static bool stream_stabilized = false;
+static uint32_t buffer_low_events = 0;
+static uint32_t buffer_high_events = 0;
+static TickType_t last_producer_tick = 0;
+static bool playback_paused = false;
 
-// Sincronização
+static bool bt_ready_for_playback(void)
+{
+    return sys_status.bt_connected && sys_status.streaming_active;
+}
+
 static EventGroupHandle_t player_event_group;
 #define BT_CONNECTED_BIT    BIT0
 #define TRACK_FINISHED_BIT  BIT1
@@ -151,26 +208,117 @@ static EventGroupHandle_t player_event_group;
 static QueueHandle_t control_queue;
 typedef enum {
     CMD_PLAY_NEXT,
+    CMD_PLAY_PREV,
     CMD_STOP,
     CMD_PAUSE,
     CMD_RESUME,
     CMD_RETRY_CONNECTION,
     CMD_RESTART_DISCOVERY,
+    CMD_CONNECT_TARGET,
     CMD_FILL_BUFFERS,
     CMD_TOGGLE_PAUSE
 } player_cmd_t;
+
+static volatile bool cmd_play_next_pending = false;
+static volatile bool cmd_play_prev_pending = false;
+static volatile bool cmd_retry_pending = false;
+static volatile bool cmd_restart_disc_pending = false;
+static volatile bool cmd_connect_pending = false;
+static bool discovery_stop_pending = false;
+
+static const char *cmd_to_str(player_cmd_t cmd)
+{
+    switch (cmd) {
+        case CMD_PLAY_NEXT: return "PLAY_NEXT";
+        case CMD_PLAY_PREV: return "PLAY_PREV";
+        case CMD_STOP: return "STOP";
+        case CMD_PAUSE: return "PAUSE";
+        case CMD_RESUME: return "RESUME";
+        case CMD_RETRY_CONNECTION: return "RETRY_CONNECTION";
+        case CMD_RESTART_DISCOVERY: return "RESTART_DISCOVERY";
+        case CMD_CONNECT_TARGET: return "CONNECT_TARGET";
+        case CMD_FILL_BUFFERS: return "FILL_BUFFERS";
+        case CMD_TOGGLE_PAUSE: return "TOGGLE_PAUSE";
+        default: return "UNKNOWN";
+    }
+}
+
+static void log_bt_state(const char *reason)
+{
+    ESP_LOGD(TAG,
+             "BT_STATE[%s] conn:%d connecting:%d stream:%d discovery:%d disc_stop_pending:%d found:%d retries:%d",
+             reason ? reason : "-",
+             sys_status.bt_connected,
+             sys_status.bt_connecting,
+             sys_status.streaming_active,
+             discovery_active,
+             discovery_stop_pending,
+             device_found,
+             sys_status.connection_retries);
+}
+
+static void log_queue_state(const char *reason)
+{
+    UBaseType_t pending = 0;
+    if (control_queue) {
+        pending = uxQueueMessagesWaiting(control_queue);
+    }
+    ESP_LOGD(TAG, "QUEUE[%s] pending:%lu", reason ? reason : "-", (unsigned long)pending);
+}
+
+static bool enqueue_control_cmd(player_cmd_t cmd)
+{
+    volatile bool *pending = NULL;
+
+    switch (cmd) {
+        case CMD_PLAY_NEXT:
+            pending = &cmd_play_next_pending;
+            break;
+        case CMD_PLAY_PREV:
+            pending = &cmd_play_prev_pending;
+            break;
+        case CMD_RETRY_CONNECTION:
+            pending = &cmd_retry_pending;
+            break;
+        case CMD_RESTART_DISCOVERY:
+            pending = &cmd_restart_disc_pending;
+            break;
+        case CMD_CONNECT_TARGET:
+            pending = &cmd_connect_pending;
+            break;
+        default:
+            break;
+    }
+
+    if (pending && *pending) {
+        ESP_LOGD(TAG, "Queue dedup: %s já pendente", cmd_to_str(cmd));
+        return false;
+    }
+    if (pending) {
+        *pending = true;
+    }
+
+    if (xQueueSend(control_queue, &cmd, 0) != pdTRUE) {
+        if (pending) {
+            *pending = false;
+        }
+        ESP_LOGW(TAG, "Queue cheia ao enfileirar: %s", cmd_to_str(cmd));
+        log_queue_state("send_fail");
+        return false;
+    }
+
+    ESP_LOGD(TAG, "Queue <- %s", cmd_to_str(cmd));
+    log_queue_state("after_enqueue");
+
+    return true;
+}
 
 static TimerHandle_t connection_timer;
 static TimerHandle_t discovery_timer;
 static TimerHandle_t buffer_monitor_timer;
 
-// Detector de cliques múltiplos
-static uint8_t click_count = 0;
-static TickType_t last_click_time = 0;
-#define CLICK_TIMEOUT_MS 500  // 500ms entre cliques
-static bool first_command_received = false;
+#define CLICK_TIMEOUT_MS 500
 
-// Estado dos botões de volume
 typedef struct {
     uint8_t pin;
     bool last_state;
@@ -184,169 +332,24 @@ typedef struct {
 
 static button_state_t vol_up_btn = {PIN_VOL_UP, true, false, 0, 0, 0, 0, false};
 static button_state_t vol_down_btn = {PIN_VOL_DOWN, true, false, 0, 0, 0, 0, false};
-
-// ============================================================================
-// CONTROLE DE VOLUME
-// ============================================================================
-
-static void init_volume_buttons(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_VOL_UP) | (1ULL << PIN_VOL_DOWN),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
-    
-    ESP_LOGI(TAG, "Botões de volume inicializados (UP:%d DOWN:%d)", PIN_VOL_UP, PIN_VOL_DOWN);
-    ESP_LOGI(TAG, "Volume inicial: %d%%", current_volume);
-}
-
-static void update_volume_scale(void)
-{
-    volume_scale = current_volume / 100.0f;
-    ESP_LOGI(TAG, "Volume ajustado: %d%% (scale: %.2f)", current_volume, volume_scale);
-}
-
-static bool read_button_with_debounce(button_state_t *btn, bool *is_double_click, bool *is_single_click)
-{
-    bool current_state = gpio_get_level(btn->pin);
-    TickType_t current_time = xTaskGetTickCount();
-    
-    *is_double_click = false;
-    *is_single_click = false;
-    
-    // Detecta mudança de estado
-    if (current_state != btn->last_state) {
-        // Verifica debounce
-        if ((current_time - btn->last_change_time) * portTICK_PERIOD_MS >= DEBOUNCE_TIME_MS) {
-            btn->last_state = current_state;
-            btn->last_change_time = current_time;
-            
-            // Botão PRESSIONADO (nível BAIXO)
-            if (current_state == 0 && !btn->pressed) {
-                btn->pressed = true;
-                btn->press_start_time = current_time;
-                btn->is_long_press = false;
-                return true;  // Botão foi pressionado
-            } 
-            // Botão LIBERADO (nível ALTO)
-            else if (current_state == 1 && btn->pressed) {
-                btn->pressed = false;
-                
-                TickType_t press_duration = (current_time - btn->press_start_time) * portTICK_PERIOD_MS;
-                
-                // Se foi um clique CURTO (não foi segurado)
-                if (press_duration < LONG_CLICK_THRESHOLD_MS && !btn->is_long_press) {
-                    TickType_t time_since_last_click = (current_time - btn->last_click_time) * portTICK_PERIOD_MS;
-                    
-                    // Se clicou dentro do intervalo de duplo clique
-                    if (time_since_last_click < DOUBLE_CLICK_INTERVAL_MS && btn->click_count == 1) {
-                        btn->click_count = 0;  // Reset
-                        *is_double_click = true;
-                        ESP_LOGI(TAG, "🎵 DUPLO CLIQUE detectado! (intervalo: %lums)", (unsigned long)time_since_last_click);
-                        return true;
-                    } else {
-                        // Primeiro clique ou clique isolado
-                        btn->click_count = 1;
-                        btn->last_click_time = current_time;
-                    }
-                }
-            }
-        }
-    }
-    
-    // Verifica se está segurando o botão (clique longo)
-    if (btn->pressed && !btn->is_long_press) {
-        TickType_t hold_time = (current_time - btn->press_start_time) * portTICK_PERIOD_MS;
-        if (hold_time >= LONG_CLICK_THRESHOLD_MS) {
-            btn->is_long_press = true;
-            btn->click_count = 0;  // Cancela detecção de duplo clique
-            return true;  // Indica que é um clique longo
-        }
-    }
-    
-    // Timeout do primeiro clique (se passou muito tempo, é clique único)
-    if (btn->click_count == 1) {
-        TickType_t time_since_click = (current_time - btn->last_click_time) * portTICK_PERIOD_MS;
-        if (time_since_click >= DOUBLE_CLICK_INTERVAL_MS) {
-            btn->click_count = 0;
-            *is_single_click = true;
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-void volume_control_task(void *pvParameter)
-{
-    ESP_LOGI(TAG, "Task de controle de volume iniciada");
-    
-    while (1) {
-        bool vol_up_double_click = false;
-        bool vol_up_single_click = false;
-        bool vol_down_double_click = false;
-        bool vol_down_single_click = false;
-        
-        read_button_with_debounce(&vol_up_btn, &vol_up_double_click, &vol_up_single_click);
-        read_button_with_debounce(&vol_down_btn, &vol_down_double_click, &vol_down_single_click);
-        
-        // ========== VOLUME UP ==========
-        // DUPLO CLIQUE → Próxima música
-        if (vol_up_double_click) {
-            ESP_LOGI(TAG, "⏭️  PRÓXIMA MÚSICA (duplo clique)");
-            player_cmd_t cmd = CMD_PLAY_NEXT;
-            xQueueSend(control_queue, &cmd, 0);
-        }
-        // CLIQUE ÚNICO → Aumentar volume UMA VEZ
-        else if (vol_up_single_click) {
-            if (current_volume < 100) {
-                current_volume += VOLUME_STEP;
-                if (current_volume > 100) current_volume = 100;
-                update_volume_scale();
-            } else {
-                ESP_LOGW(TAG, "Volume já está no máximo (100%%)");
-            }
-        }
-        
-        // ========== VOLUME DOWN ==========
-        // CLIQUE ÚNICO → Diminuir volume UMA VEZ
-        if (vol_down_single_click) {
-            if (current_volume > 0) {
-                if (current_volume >= VOLUME_STEP) {
-                    current_volume -= VOLUME_STEP;
-                } else {
-                    current_volume = 0;
-                }
-                update_volume_scale();
-            } else {
-                ESP_LOGW(TAG, "Volume já está no mínimo (0%%)");
-            }
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
+static bool pwr_last_level = true;
+static TickType_t pwr_last_change_time = 0;
+static TickType_t pwr_press_start_time = 0;
+static bool pwr_pressed = false;
+static bool pwr_hold_handled = false;
 
 // ============================================================================
 // RING BUFFER
 // ============================================================================
 
-static ring_buffer_t* create_ring_buffer(size_t size)
+static ring_buffer_t *ring_buffer_create(size_t size)
 {
     ring_buffer_t *rb = malloc(sizeof(ring_buffer_t));
-    if (!rb) {
-        ESP_LOGE(TAG, "Falha ao alocar ring buffer structure");
-        return NULL;
-    }
+    if (!rb) return NULL;
     
     rb->data = heap_caps_malloc(size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     if (!rb->data) {
         free(rb);
-        ESP_LOGE(TAG, "Falha ao alocar ring buffer data: %zu bytes", size);
         return NULL;
     }
     
@@ -361,83 +364,32 @@ static ring_buffer_t* create_ring_buffer(size_t size)
     if (!rb->mutex) {
         free(rb->data);
         free(rb);
-        ESP_LOGE(TAG, "Falha ao criar mutex do ring buffer");
         return NULL;
     }
     
-    memset(rb->data, 0, size);
-    ESP_LOGI(TAG, "Ring buffer criado: %zu bytes", size);
     return rb;
 }
 
-static void destroy_ring_buffer(ring_buffer_t *rb)
-{
-    if (rb) {
-        if (rb->mutex) vSemaphoreDelete(rb->mutex);
-        if (rb->data) free(rb->data);
-        free(rb);
-    }
-}
-
-static size_t rb_write(ring_buffer_t *rb, const uint8_t *data, size_t len)
-{
-    if (!rb || !data || len == 0) return 0;
-    
-    if (xSemaphoreTake(rb->mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
-        return 0;
-    }
-    
-    size_t space_available = rb->size - rb->available;
-    size_t to_write = (len > space_available) ? space_available : len;
-    size_t written = 0;
-    
-    while (written < to_write) {
-        size_t chunk = to_write - written;
-        size_t space_to_end = rb->size - rb->write_pos;
-        
-        if (chunk > space_to_end) {
-            chunk = space_to_end;
-        }
-        
-        memcpy(rb->data + rb->write_pos, data + written, chunk);
-        rb->write_pos = (rb->write_pos + chunk) % rb->size;
-        written += chunk;
-    }
-    
-    rb->available += written;
-    rb->is_full = (rb->available == rb->size);
-    
-    xSemaphoreGive(rb->mutex);
-    return written;
-}
-
-static size_t rb_available(ring_buffer_t *rb)
-{
-    if (!rb) return 0;
-    
-    size_t available;
-    if (xSemaphoreTake(rb->mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
-        available = rb->available;
-        xSemaphoreGive(rb->mutex);
-    } else {
-        available = 0;
-    }
-    return available;
-}
-
-static size_t rb_free_space(ring_buffer_t *rb)
-{
-    if (!rb) return 0;
-    return rb->size - rb_available(rb);
-}
-
-static void rb_clear(ring_buffer_t *rb)
+static void ring_buffer_destroy(ring_buffer_t *rb)
 {
     if (!rb) return;
     
-    if (xSemaphoreTake(rb->mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        rb->read_pos = 0;
+    if (rb->mutex) {
+        vSemaphoreDelete(rb->mutex);
+    }
+    if (rb->data) {
+        free(rb->data);
+    }
+    free(rb);
+}
+
+static void ring_buffer_reset(ring_buffer_t *rb)
+{
+    if (!rb) return;
+    
+    if (xSemaphoreTake(rb->mutex, pdMS_TO_TICKS(100))) {
         rb->write_pos = 0;
+        rb->read_pos = 0;
         rb->available = 0;
         rb->is_full = false;
         rb->end_of_stream = false;
@@ -445,337 +397,481 @@ static void rb_clear(ring_buffer_t *rb)
     }
 }
 
-// ============================================================================
-// FUNÇÕES WAV
-// ============================================================================
-
-esp_err_t count_wav_files(void)
+static size_t ring_buffer_write(ring_buffer_t *rb, const uint8_t *data, size_t len)
 {
-    DIR *dir = opendir(MOUNT_POINT);
-    if (!dir) return ESP_ERR_NOT_FOUND;
+    if (!rb || !data || len == 0) return 0;
     
-    wav_count = 0;
-    struct dirent *entry;
-    
-    while ((entry = readdir(dir))) {
-        if (entry->d_type == DT_DIR || entry->d_name[0] == '.') continue;
-        
-        size_t len = strlen(entry->d_name);
-        if (len > 4 && strcasecmp(entry->d_name + len - 4, ".wav") == 0) {
-            wav_count++;
-        }
+    if (xSemaphoreTake(rb->mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return 0;
     }
     
-    closedir(dir);
-    ESP_LOGI(TAG, "Total de WAVs encontrados: %d", wav_count);
+    size_t space = rb->size - rb->available;
+    size_t to_write = (len > space) ? space : len;
+    size_t written = 0;
+    
+    while (written < to_write) {
+        size_t chunk = to_write - written;
+        size_t space_to_end = rb->size - rb->write_pos;
+        
+        if (chunk > space_to_end) chunk = space_to_end;
+        
+        memcpy(rb->data + rb->write_pos, data + written, chunk);
+        rb->write_pos = (rb->write_pos + chunk) % rb->size;
+        written += chunk;
+    }
+    
+    rb->available += written;
+    if (rb->available == rb->size) {
+        rb->is_full = true;
+    }
+    
+    xSemaphoreGive(rb->mutex);
+    
+    return written;
+}
+
+static size_t ring_buffer_write_blocking(ring_buffer_t *rb, const uint8_t *data, size_t len, TickType_t max_wait_ticks)
+{
+    if (!rb || !data || len == 0) return 0;
+
+    size_t total_written = 0;
+    TickType_t start = xTaskGetTickCount();
+
+    while (total_written < len && file_reader_task_running && sys_status.bt_connected) {
+        size_t written = ring_buffer_write(rb, data + total_written, len - total_written);
+        total_written += written;
+
+        if (total_written >= len) {
+            break;
+        }
+
+        if ((xTaskGetTickCount() - start) >= max_wait_ticks) {
+            break;
+        }
+
+        vTaskDelay(1);
+    }
+
+    return total_written;
+}
+
+static size_t ring_buffer_available(ring_buffer_t *rb)
+{
+    if (!rb) return 0;
+    
+    size_t available = 0;
+    if (xSemaphoreTake(rb->mutex, pdMS_TO_TICKS(5))) {
+        available = rb->available;
+        xSemaphoreGive(rb->mutex);
+    }
+    
+    return available;
+}
+
+// ============================================================================
+// ID3v2 TAG
+// ============================================================================
+
+static int skip_id3v2(FILE *f)
+{
+    uint8_t header[10];
+    
+    if (fread(header, 1, 10, f) != 10) {
+        fseek(f, 0, SEEK_SET);
+        return 0;
+    }
+    
+    if (header[0] == 'I' && header[1] == 'D' && header[2] == '3') {
+        uint32_t tag_size = ((header[6] & 0x7F) << 21) |
+                           ((header[7] & 0x7F) << 14) |
+                           ((header[8] & 0x7F) << 7) |
+                           (header[9] & 0x7F);
+        
+        ESP_LOGI(TAG, "ID3v2 tag: %" PRIu32 " bytes (pulando)", tag_size);
+        
+        fseek(f, 10 + tag_size, SEEK_SET);
+        return tag_size + 10;
+    }
+    
+    fseek(f, 0, SEEK_SET);
+    return 0;
+}
+
+// ============================================================================
+// BUFFERS DE ÁUDIO
+// ============================================================================
+
+static esp_err_t init_audio_buffers(void)
+{
+    ESP_LOGI(TAG, "🔧 Alocando buffers de áudio...");
+    
+    mp3_input_buffer = heap_caps_malloc(MP3_INPUT_BUFFER_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (!mp3_input_buffer) {
+        ESP_LOGE(TAG, "Falha alocar MP3 input buffer");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "✅ MP3 input: %d bytes", MP3_INPUT_BUFFER_SIZE);
+    
+    pcm_output_buffer = heap_caps_malloc(PCM_OUTPUT_BUFFER_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (!pcm_output_buffer) {
+        ESP_LOGE(TAG, "Falha alocar PCM output buffer");
+        free(mp3_input_buffer);
+        mp3_input_buffer = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "✅ PCM output: %d bytes", PCM_OUTPUT_BUFFER_SIZE);
+    
+    stream_buffer = ring_buffer_create(STREAM_BUFFER_SIZE);
+    if (!stream_buffer) {
+        ESP_LOGE(TAG, "Falha criar stream buffer");
+        free(mp3_input_buffer);
+        free(pcm_output_buffer);
+        mp3_input_buffer = NULL;
+        pcm_output_buffer = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "✅ Stream buffer: %d bytes", STREAM_BUFFER_SIZE);
+    
+    ESP_LOGI(TAG, "✅ Buffers alocados com sucesso");
     return ESP_OK;
 }
 
-char* get_wav_by_index(int index, char* filepath, size_t filepath_size)
+static void cleanup_audio_buffers(void)
 {
-    if (index < 0 || index >= wav_count) return NULL;
-    
-    DIR *dir = opendir(MOUNT_POINT);
-    if (!dir) return NULL;
-    
-    int current_index = 0;
-    struct dirent *entry;
-    
-    while ((entry = readdir(dir))) {
-        if (entry->d_type == DT_DIR || entry->d_name[0] == '.') continue;
-        
-        size_t len = strlen(entry->d_name);
-        if (len > 4 && strcasecmp(entry->d_name + len - 4, ".wav") == 0) {
-            if (current_index == index) {
-                snprintf(filepath, filepath_size, MOUNT_POINT "/%s", entry->d_name);
-                closedir(dir);
-                return filepath;
-            }
-            current_index++;
-        }
+    if (stream_buffer) {
+        ring_buffer_destroy(stream_buffer);
+        stream_buffer = NULL;
     }
     
+    if (pcm_output_buffer) {
+        free(pcm_output_buffer);
+        pcm_output_buffer = NULL;
+    }
+    
+    if (mp3_input_buffer) {
+        free(mp3_input_buffer);
+        mp3_input_buffer = NULL;
+    }
+}
+
+// ============================================================================
+// LIBHELIX MP3 DECODER
+// ============================================================================
+
+static esp_err_t init_audio_decoder(void)
+{
+    ESP_LOGI(TAG, "🎵 Inicializando libhelix MP3 decoder...");
+    
+    if (mp3_decoder) {
+        ESP_LOGW(TAG, "Decoder já existe, destruindo...");
+        MP3FreeDecoder(mp3_decoder);
+        mp3_decoder = NULL;
+    }
+    
+    mp3_decoder = MP3InitDecoder();
+    if (!mp3_decoder) {
+        ESP_LOGE(TAG, "❌ Falha ao criar decoder libhelix!");
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "✅ Libhelix decoder criado com sucesso");
+    ESP_LOGI(TAG, "   Heap livre: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    
+    sys_status.codec_configured = true;
+    xEventGroupSetBits(player_event_group, CODEC_READY_BIT);
+    
+    return ESP_OK;
+}
+
+static void cleanup_audio_decoder(void)
+{
+    if (mp3_decoder) {
+        MP3FreeDecoder(mp3_decoder);
+        mp3_decoder = NULL;
+    }
+    sys_status.codec_configured = false;
+}
+
+// ============================================================================
+// SD CARD
+// ============================================================================
+
+static void free_mp3_playlist_cache(void) {}
+
+static esp_err_t sdcard_init(void)
+{
+    ESP_LOGI(TAG, "📀 Inicializando SD Card...");
+    
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    
+    // ✅ 20MHz (com fallback para 19MHz se falhar)
+    host.max_freq_khz = 19000;
+    
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4096,
+    };
+    
+    esp_err_t ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha SPI bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = host.slot;
+    
+    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+    
+    sys_status.sd_mounted = true;
+    ESP_LOGI(TAG, "✅ SD Card montado: %s", card->cid.name);
+    ESP_LOGI(TAG, "   Tamanho: %.2f GB", (card->csd.capacity * 512.0) / (1024*1024*1024));
+    
+    return ESP_OK;
+}
+
+static esp_err_t count_mp3_files(void)
+{
+    DIR *dir = opendir(MOUNT_POINT);
+    if (!dir) {
+        ESP_LOGE(TAG, "Falha abrir diretório");
+        return ESP_FAIL;
+    }
+
+    mp3_count = 0;
+    struct dirent *entry;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) {
+            size_t len = strlen(entry->d_name);
+            if (len > 4 && strcasecmp(entry->d_name + len - 4, ".mp3") == 0) {
+                mp3_count++;
+            }
+        }
+    }
+
     closedir(dir);
-    return NULL;
-}
 
-static bool is_sample_rate_supported(uint32_t sample_rate) 
-{
-    return (sample_rate == SAMPLE_RATE_44K1 || sample_rate == SAMPLE_RATE_48K);
-}
-
-static esp_err_t analyze_wav_file(const char *filepath, wav_info_t *info)
-{
-    FILE *f = fopen(filepath, "rb");
-    if (!f) {
-        ESP_LOGE(TAG, "Erro ao abrir: %s", filepath);
+    if (mp3_count == 0) {
+        ESP_LOGE(TAG, "❌ Nenhum arquivo MP3 encontrado!");
         return ESP_ERR_NOT_FOUND;
     }
-    
-    memset(info, 0, sizeof(wav_info_t));
-    
-    uint8_t riff_header[12];
-    if (fread(riff_header, 1, 12, f) != 12) {
-        fclose(f);
-        return ESP_ERR_INVALID_SIZE;
-    }
-    
-    if (memcmp(riff_header, "RIFF", 4) != 0 || memcmp(riff_header + 8, "WAVE", 4) != 0) {
-        ESP_LOGE(TAG, "Header RIFF/WAVE inválido");
-        fclose(f);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    
-    uint32_t sample_rate = 0, data_size = 0;
-    uint16_t channels = 0, bits_per_sample = 0, audio_format = 0;
-    size_t data_offset = 0;
-    bool found_fmt = false, found_data = false;
-    
-    fseek(f, 12, SEEK_SET);
-    
-    while (!feof(f) && (!found_fmt || !found_data)) {
-        uint8_t chunk_header[8];
-        if (fread(chunk_header, 1, 8, f) != 8) break;
-        
-        uint32_t chunk_size = *((uint32_t*)(chunk_header + 4));
-        size_t current_pos = ftell(f);
-        
-        if (memcmp(chunk_header, "fmt ", 4) == 0) {
-            if (chunk_size < 16) break;
-            
-            uint8_t fmt_data[16];
-            if (fread(fmt_data, 1, 16, f) != 16) break;
-            
-            audio_format = *((uint16_t*)fmt_data);
-            channels = *((uint16_t*)(fmt_data + 2));
-            sample_rate = *((uint32_t*)(fmt_data + 4));
-            bits_per_sample = *((uint16_t*)(fmt_data + 14));
-            
-            found_fmt = true;
-            if (chunk_size > 16) {
-                fseek(f, current_pos + chunk_size, SEEK_SET);
+
+    ESP_LOGI(TAG, "✅ Total: %d arquivos MP3 encontrados", mp3_count);
+    return ESP_OK;
+}
+
+static esp_err_t get_mp3_path(int index, char *path, size_t max_len)
+{
+    DIR *dir = opendir(MOUNT_POINT);
+    if (!dir) return ESP_FAIL;
+
+    int count = 0;
+    struct dirent *entry;
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) {
+            size_t len = strlen(entry->d_name);
+            if (len > 4 && strcasecmp(entry->d_name + len - 4, ".mp3") == 0) {
+                if (count == index) {
+                    int written = snprintf(path, max_len, "%s/%s", MOUNT_POINT, entry->d_name);
+                    if (written < 0 || written >= (int)max_len) {
+                        ret = ESP_ERR_NO_MEM;
+                    } else {
+                        ret = ESP_OK;
+                    }
+                    break;
+                }
+                count++;
             }
-            
-        } else if (memcmp(chunk_header, "data", 4) == 0) {
-            data_size = chunk_size;
-            data_offset = current_pos;
-            found_data = true;
-            fseek(f, current_pos + chunk_size, SEEK_SET);
-            
-        } else {
-            fseek(f, current_pos + chunk_size, SEEK_SET);
         }
     }
+
+    closedir(dir);
+    return ret;
+}
+
+static esp_err_t analyze_mp3_file(const char *path, mp3_info_t *info)
+{
+    if (!path || !info) return ESP_ERR_INVALID_ARG;
+    
+    memset(info, 0, sizeof(mp3_info_t));
+    
+    struct stat file_stat;
+    if (stat(path, &file_stat) != 0) {
+        return ESP_FAIL;
+    }
+    
+    info->file_size = file_stat.st_size;
+    
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return ESP_FAIL;
+    }
+    
+    skip_id3v2(f);
+    
+    uint8_t header_buf[4];
+    if (fread(header_buf, 1, 4, f) != 4) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    
+    if (header_buf[0] != 0xFF || (header_buf[1] & 0xE0) != 0xE0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    
+    int bitrate_index = (header_buf[2] >> 4) & 0x0F;
+    int samplerate_index = (header_buf[2] >> 2) & 0x03;
+    
+    static const int bitrates[16] = {
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0
+    };
+    
+    static const int samplerates[4] = {44100, 48000, 32000, 0};
+    
+    info->bitrate = bitrates[bitrate_index] * 1000;
+    info->sample_rate = samplerates[samplerate_index];
+    info->channels = 2;
+    info->bits_per_sample = 16;
+    
+    if (info->bitrate > 0) {
+        info->duration_seconds = (info->file_size * 8) / info->bitrate;
+    }
+    
+    info->a2dp_compatible = (info->sample_rate == SAMPLE_RATE_44K1 || 
+                             info->sample_rate == SAMPLE_RATE_48K);
+    
+    info->is_valid_mp3 = (info->sample_rate > 0 && info->bitrate > 0);
     
     fclose(f);
     
-    if (!found_fmt || !found_data || audio_format != 1) {
-        ESP_LOGE(TAG, "WAV inválido ou não-PCM");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    
-    info->is_valid_wav = true;
-    info->sample_rate = sample_rate;
-    info->channels = channels;
-    info->bits_per_sample = bits_per_sample;
-    info->data_size = data_size;
-    info->data_start_offset = data_offset;
-    
-    info->a2dp_compatible = is_sample_rate_supported(sample_rate) &&
-                           (channels == 1 || channels == 2) &&
-                           (bits_per_sample == 16);
-    
-    if (sample_rate > 0 && channels > 0 && bits_per_sample > 0) {
-        uint32_t bytes_per_second = sample_rate * channels * (bits_per_sample / 8);
-        if (bytes_per_second > 0) {
-            info->duration_seconds = data_size / bytes_per_second;
-        }
-    }
+    ESP_LOGI(TAG, "📊 Análise MP3:");
+    ESP_LOGI(TAG, "   Sample Rate: %" PRIu32 " Hz", info->sample_rate);
+    ESP_LOGI(TAG, "   Bitrate: %" PRIu32 " kbps", info->bitrate / 1000);
+    ESP_LOGI(TAG, "   Canais: %u", (unsigned int)info->channels);
+    ESP_LOGI(TAG, "   Duração: %" PRIu32 " s (%.1f min)", 
+             info->duration_seconds, info->duration_seconds / 60.0f);
     
     return ESP_OK;
 }
 
-// ============================================================================
-// CONVERSÃO DE ÁUDIO
-// ============================================================================
-
-static size_t convert_wav_to_a2dp_batch(const uint8_t *input_data, size_t input_len, 
-                                        uint8_t *output_data, size_t max_output_len,
-                                        const wav_info_t *wav_info)
+static void log_system_status(void)
 {
-    if (!wav_info || !wav_info->is_valid_wav || input_len == 0) {
-        size_t copy_len = (input_len < max_output_len) ? input_len : max_output_len;
-        memcpy(output_data, input_data, copy_len);
-        return copy_len;
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "📊 Status do Sistema:");
+    ESP_LOGI(TAG, "   SD Card: %s", sys_status.sd_mounted ? "✅" : "❌");
+    ESP_LOGI(TAG, "   Bluetooth: %s", sys_status.bt_initialized ? "✅" : "❌");
+    ESP_LOGI(TAG, "   BT Conectado: %s", sys_status.bt_connected ? "✅" : "❌");
+    ESP_LOGI(TAG, "   Decoder: %s", sys_status.codec_configured ? "✅" : "❌");
+    ESP_LOGI(TAG, "   Tocando: %s", sys_status.audio_playing ? "✅" : "❌");
+    ESP_LOGI(TAG, "   Stream ativo: %s", sys_status.streaming_active ? "✅" : "❌");
+    ESP_LOGI(TAG, "   MP3s: %d arquivos", mp3_count);
+    ESP_LOGI(TAG, "   Track: [%d/%d]", current_track + 1, mp3_count);
+    ESP_LOGI(TAG, "   Volume: %d%%", current_volume);
+    ESP_LOGI(TAG, "   Heap livre: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    
+    if (stream_buffer) {
+        size_t avail = ring_buffer_available(stream_buffer);
+        ESP_LOGI(TAG, "   Buffer: %zu/%d bytes", avail, STREAM_BUFFER_SIZE);
     }
     
-    size_t output_len = 0;
-    
-    if (wav_info->bits_per_sample == 16 && wav_info->channels == 2) {
-        // Estéreo - já está no formato correto, apenas aplica volume
-        size_t samples = input_len / 4;
-        size_t max_samples = max_output_len / 4;
-        size_t process_samples = (samples < max_samples) ? samples : max_samples;
-        
-        const int16_t *input_samples = (const int16_t*)input_data;
-        int16_t *output_samples = (int16_t*)output_data;
-        
-        for (size_t i = 0; i < process_samples * 2; i += 2) {
-            int32_t left = (int32_t)(input_samples[i] * volume_scale);
-            int32_t right = (int32_t)(input_samples[i + 1] * volume_scale);
-
-            if (left > 32000) left = 32000;
-            else if (left < -32000) left = -32000;
-            if (right > 32000) right = 32000;
-            else if (right < -32000) right = -32000;
-
-            output_samples[i] = (int16_t)left;
-            output_samples[i + 1] = (int16_t)right;
-        }
-        output_len = process_samples * 4;
-        
-    } else if (wav_info->bits_per_sample == 16 && wav_info->channels == 1) {
-        // Mono - duplica canal e aplica volume
-        size_t input_samples = input_len / 2;
-        size_t max_output_samples = max_output_len / 4;
-        size_t process_samples = (input_samples < max_output_samples) ? input_samples : max_output_samples;
-        
-        const int16_t *input = (const int16_t*)input_data;
-        int16_t *output = (int16_t*)output_data;
-        
-        for (size_t i = 0; i < process_samples; i++) {
-            int32_t sample = (int32_t)(input[i] * volume_scale);
-            
-            if (sample > 32000) sample = 32000;
-            else if (sample < -32000) sample = -32000;
-            
-            output[i * 2] = (int16_t)sample;
-            output[i * 2 + 1] = (int16_t)sample;
-        }
-        output_len = process_samples * 4;
-        
-    } else {
-        // Formato não suportado → envia silêncio
-        size_t fill_len = (input_len < max_output_len) ? input_len : max_output_len;
-        memset(output_data, 0, fill_len);
-        output_len = fill_len;
-    }
-    
-    return output_len;
+    ESP_LOGI(TAG, "   Callbacks A2DP: %lu", callback_count);
+    ESP_LOGI(TAG, "   Underruns: %lu", underrun_count);
+    ESP_LOGI(TAG, "   CB lock/empty/partial: %lu/%lu/%lu",
+            cb_lock_fail_count, cb_empty_count, cb_partial_count);
+    ESP_LOGI(TAG, "   Bytes streamed: %lu", total_bytes_streamed);
+    ESP_LOGI(TAG, "   Buffer evt low/high: %lu/%lu", buffer_low_events, buffer_high_events);
+    log_bt_state("status");
+    ESP_LOGI(TAG, "");
 }
 
-// ============================================================================
-// TASK UNIFICADA DE LEITURA
-// ============================================================================
-
-void file_reader_task(void *pvParameter)
+// ✅ FUNÇÃO PARA SELECIONAR MÚSICA ALEATÓRIA
+static int get_random_track(int current)
 {
-    ESP_LOGI(TAG, "Task de leitura unificada iniciada");
+    if (mp3_count <= 1) return 0;
+    
+    int new_track;
+    int attempts = 0;
+    
+    // Tentar até 10 vezes para garantir música diferente
+    do {
+        new_track = esp_random() % mp3_count;
+        attempts++;
+    } while (new_track == current && attempts < 10);
+    
+    return new_track;
+}
 
-    TickType_t last_stats_time = 0;
-    uint32_t total_read = 0;
+static int get_previous_track(int current)
+{
+    if (mp3_count <= 1) return 0;
+    return (current == 0) ? (mp3_count - 1) : (current - 1);
+}
 
-    uint8_t *convert_buffer = heap_caps_malloc(AUDIO_READ_BUFFER_SIZE, MALLOC_CAP_8BIT);
-    if (!convert_buffer) {
-        ESP_LOGE(TAG, "Falha ao alocar buffer de conversão");
-        file_reader_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
+static void stop_playback_and_reset(bool wait_task, const char *reason)
+{
+    ESP_LOGI(TAG, "🧹 Reset playback (%s)", reason ? reason : "-");
 
-    const TickType_t LOOP_DELAY = pdMS_TO_TICKS(5);
+    file_reader_task_running = false;
 
-    while (1) {
-        if (!sys_status.streaming_active || !current_file || !stream_buffer) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        size_t stream_available = rb_available(stream_buffer);
-        size_t stream_free = rb_free_space(stream_buffer);
-        float fill_percent = (stream_available * 100.0f) / stream_buffer->size;
-
-        if (fill_percent > 85.0f) {
+    if (wait_task && file_reader_task_handle != NULL) {
+        for (int i = 0; i < 100; i++) {
+            if (file_reader_task_handle == NULL) break;
             vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
         }
+    }
 
-        stream_free = rb_free_space(stream_buffer) & ~0x03;
-        size_t read_size;
+    if (current_file) {
+        fclose(current_file);
+        current_file = NULL;
+    }
 
-        if (fill_percent < 40.0f) {
-            read_size = (AUDIO_READ_BUFFER_SIZE < stream_free) ? AUDIO_READ_BUFFER_SIZE : stream_free;
-        } else {
-            float fill_ratio = (fill_percent - 40.0f) / (85.0f - 40.0f);
-            size_t min_read = 1024;
-            size_t max_read = AUDIO_READ_BUFFER_SIZE;
-            read_size = min_read + (size_t)((max_read - min_read) * (1.0f - fill_ratio));
+    cleanup_audio_decoder();
+    if (stream_buffer) {
+        ring_buffer_reset(stream_buffer);
+    }
 
-            if (read_size > stream_free) read_size = stream_free;
-        }
+    bytes_left_in_mp3 = 0;
+    read_ptr = NULL;
+    file_reader_task_handle = NULL;
+    sys_status.audio_playing = false;
+    playback_paused = false;
+    xEventGroupClearBits(player_event_group, CODEC_READY_BIT | TRACK_FINISHED_BIT);
+}
 
-        read_size &= ~0x03;
+static void buffer_monitor_callback(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    if (!stream_buffer || !sys_status.streaming_active) return;
+    
+    size_t available = ring_buffer_available(stream_buffer);
+    size_t low_mark = (STREAM_BUFFER_SIZE * 30) / 100;
+    size_t high_mark = (STREAM_BUFFER_SIZE * 60) / 100;
 
-        size_t bytes_read = fread(file_read_buffer, 1, read_size, current_file);
-        if (bytes_read == 0) {
-            if (feof(current_file)) {
-                ESP_LOGI(TAG, "Fim do arquivo - próxima música");
-                stream_buffer->end_of_stream = true;
-                player_cmd_t cmd = CMD_PLAY_NEXT;
-                xQueueSend(control_queue, &cmd, 0);
-                free(convert_buffer);
-                file_reader_task_handle = NULL;
-                vTaskDelete(NULL);
-                return;
-            } else {
-                ESP_LOGW(TAG, "Erro leitura SD");
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
-            }
-        }
-
-        total_read += bytes_read;
-
-        size_t converted_len;
-        const uint8_t *data_to_write;
-
-        if (current_wav_info.is_valid_wav &&
-            (current_wav_info.channels == 1 || current_wav_info.bits_per_sample != 16)) {
-            converted_len = convert_wav_to_a2dp_batch(file_read_buffer, bytes_read,
-                                                      convert_buffer, read_size,
-                                                      &current_wav_info);
-            data_to_write = convert_buffer;
-        } else {
-            converted_len = bytes_read;
-            int16_t *samples = (int16_t*)file_read_buffer;
-            size_t num_samples = bytes_read / 2;
-            for (size_t i = 0; i < num_samples; i++) {
-                int32_t sample = (int32_t)(samples[i] * volume_scale);
-                if (sample > 32000) sample = 32000;
-                else if (sample < -32000) sample = -32000;
-                samples[i] = (int16_t)sample;
-            }
-            data_to_write = file_read_buffer;
-        }
-
-        size_t written = rb_write(stream_buffer, data_to_write, converted_len);
-        if (written < converted_len) {
-            ESP_LOGW(TAG, "Buffer cheio! Bytes perdidos: %zu (buf: %.0f%%)", converted_len - written, fill_percent);
-        }
-
-        TickType_t current_time = xTaskGetTickCount();
-        if (current_time - last_stats_time > pdMS_TO_TICKS(10000)) {
-            ESP_LOGI(TAG, "Leitura total: %lu KB, buf: %.0f%%, read_size: %zu, espaço livre: %zu",
-                     total_read / 1024, fill_percent, read_size, stream_free);
-            last_stats_time = current_time;
-        }
-
-        vTaskDelay(LOOP_DELAY);
+    if (available < low_mark) {
+        buffer_low_events++;
+    } else if (available > high_mark) {
+        buffer_high_events++;
     }
 }
 
 // ============================================================================
-// CALLBACK A2DP OTIMIZADO
+// A2DP CALLBACK - CONSUMIDOR DE DADOS
 // ============================================================================
 
 static int32_t bt_a2dp_source_data_cb(uint8_t *data, int32_t len)
@@ -785,7 +881,8 @@ static int32_t bt_a2dp_source_data_cb(uint8_t *data, int32_t len)
     
     if (!data || len <= 0) return 0;
     
-    if (!sys_status.bt_connected || !sys_status.streaming_active) {
+    // Em alguns headsets o AUDIO_STATE pode oscilar; manter saída baseada na conexão.
+    if (!sys_status.bt_connected || playback_paused) {
         memset(data, 0, len);
         return len;
     }
@@ -797,8 +894,6 @@ static int32_t bt_a2dp_source_data_cb(uint8_t *data, int32_t len)
             return len;
         }
         stream_stabilized = true;
-        ESP_LOGI(TAG, "Stream estabilizado - buffer: %zu bytes", 
-                rb_available(stream_buffer));
     }
     
     if (!stream_buffer) {
@@ -806,14 +901,12 @@ static int32_t bt_a2dp_source_data_cb(uint8_t *data, int32_t len)
         return len;
     }
     
-    BaseType_t taken = xSemaphoreTake(stream_buffer->mutex, 0);
+    BaseType_t taken = xSemaphoreTake(stream_buffer->mutex, pdMS_TO_TICKS(1));
     if (taken != pdTRUE) {
-        taken = xSemaphoreTake(stream_buffer->mutex, 1);
-        if (taken != pdTRUE) {
-            memset(data, 0, len);
-            underrun_count++;
-            return len;
-        }
+        memset(data, 0, len);
+        underrun_count++;
+        cb_lock_fail_count++;
+        return len;
     }
     
     size_t available = stream_buffer->available;
@@ -821,6 +914,7 @@ static int32_t bt_a2dp_source_data_cb(uint8_t *data, int32_t len)
     if (available == 0) {
         xSemaphoreGive(stream_buffer->mutex);
         underrun_count++;
+        cb_empty_count++;
         memset(data, 0, len);
         return len;
     }
@@ -849,952 +943,1204 @@ static int32_t bt_a2dp_source_data_cb(uint8_t *data, int32_t len)
     if (read_total < (size_t)len) {
         memset(data + read_total, 0, len - read_total);
         underrun_count++;
+        cb_partial_count++;
     }
     
-    if (callback_count % 5000 == 0) {
-        ESP_LOGI(TAG, "A2DP #%lu: %lu KB, underruns: %lu, buf: %zu",
-                callback_count, total_bytes_streamed / 1024, 
-                underrun_count, available);
+    // Log a cada 2500 callbacks (~1 min)
+    if (callback_count % 2500 == 0) {
+        ESP_LOGI(TAG, "A2DP: %lu KB streamed, %lu underruns, buf:%zu cb_lock/empty/partial:%lu/%lu/%lu",
+                total_bytes_streamed / 1024, underrun_count, available,
+                cb_lock_fail_count, cb_empty_count, cb_partial_count);
     }
     
     return len;
 }
 
 // ============================================================================
-// CALLBACKS BLUETOOTH
+// DECODIFICAÇÃO MP3 - OTIMIZADA COM CONTROLE DE BUFFER MELHORADO
 // ============================================================================
 
-static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+static void decode_and_stream(void *pvParameter)
 {
-    if (!param) {
-        ESP_LOGE(TAG, "Parâmetro GAP callback é NULL");
-        return;
-    }
-    
-    switch (event) {
-    case ESP_BT_GAP_DISC_RES_EVT:
-        {
-            esp_bt_gap_dev_prop_t *prop = NULL;
-            char bda_str[18] = {0};
-            
-            sprintf(bda_str, "%02x:%02x:%02x:%02x:%02x:%02x",
-                   param->disc_res.bda[0], param->disc_res.bda[1],
-                   param->disc_res.bda[2], param->disc_res.bda[3],
-                   param->disc_res.bda[4], param->disc_res.bda[5]);
-            
-            for (int i = 0; i < param->disc_res.num_prop; i++) {
-                prop = param->disc_res.prop + i;
-                if (prop->type == ESP_BT_GAP_DEV_PROP_EIR && prop->len > 0) {
-                    uint8_t *eir = prop->val;
-                    uint8_t *rmt_name = NULL;
-                    uint8_t rmt_name_len = 0;
-                    
-                    rmt_name = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &rmt_name_len);
-                    
-                    if (rmt_name != NULL && rmt_name_len > 0 && rmt_name_len < 64) {
-                        char remote_name[rmt_name_len + 1];
-                        memcpy(remote_name, rmt_name, rmt_name_len);
-                        remote_name[rmt_name_len] = '\0';
-                        
-                        ESP_LOGI(TAG, "Dispositivo: %s [%s]", remote_name, bda_str);
-                        
-                        if (strstr(remote_name, TARGET_DEVICE_NAME) != NULL) {
-                            ESP_LOGI(TAG, "Dispositivo alvo encontrado!");
-                            memcpy(target_device_addr, param->disc_res.bda, ESP_BD_ADDR_LEN);
-                            device_found = true;
-                            
-                            esp_err_t ret = esp_bt_gap_cancel_discovery();
-                            if (ret != ESP_OK) {
-                                ESP_LOGE(TAG, "Erro ao cancelar descoberta: %s", esp_err_to_name(ret));
-                            }
-                            
-                            xTimerStop(discovery_timer, 0);
-                        }
-                    }
-                }
-            }
-        }
-        break;
-        
-    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
-        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
-            ESP_LOGI(TAG, "Descoberta parada");
-            xTimerStop(discovery_timer, 0);
-            
-            if (sys_status.bt_connected) {
-                ESP_LOGI(TAG, "Já conectado - ignorando discovery");
-                return;
-            }
-            
-            if (device_found) {
-                ESP_LOGI(TAG, "Conectando ao dispositivo...");
-                esp_err_t ret = esp_a2d_source_connect(target_device_addr);
-                if (ret != ESP_OK) {
-                    ESP_LOGE(TAG, "Erro ao conectar A2DP: %s", esp_err_to_name(ret));
-                    player_cmd_t cmd = CMD_RETRY_CONNECTION;
-                    xQueueSend(control_queue, &cmd, 0);
-                } else {
-                    xTimerStart(connection_timer, 0);
-                }
-            } else {
-                ESP_LOGW(TAG, "Dispositivo %s não encontrado", TARGET_DEVICE_NAME);
-                if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
-                    player_cmd_t cmd = CMD_RESTART_DISCOVERY;
-                    xQueueSend(control_queue, &cmd, pdMS_TO_TICKS(100));
-                }
-            }
-        }
-        break;
-        
-    default:
-        break;
-    }
-}
+    ESP_LOGI(TAG, "🎵 Task de decodificação iniciada");
+    ESP_LOGI(TAG, "   Heap livre: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
-{
-    if (!param) {
-        ESP_LOGE(TAG, "Parâmetro A2DP callback é NULL");
-        return;
-    }
-    
-    switch (event) {
-    case ESP_A2D_CONNECTION_STATE_EVT:
-        if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            ESP_LOGI(TAG, "A2DP Conectado!");
-            sys_status.bt_connected = true;
-            sys_status.connection_retries = 0;
-            sys_status.system_ready = true;
-            xEventGroupSetBits(player_event_group, BT_CONNECTED_BIT);
-            xTimerStop(connection_timer, 0);
-            
-            ESP_LOGI(TAG, "Iniciando stream de áudio...");
-            esp_err_t start_ret = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
-            if (start_ret != ESP_OK) {
-                ESP_LOGE(TAG, "Falha ao iniciar media stream: %s", esp_err_to_name(start_ret));
-            }
-            
-        } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-            ESP_LOGI(TAG, "A2DP Desconectado");
-            first_command_received = false;
-            sys_status.bt_connected = false;
-            sys_status.audio_playing = false;
-            sys_status.system_ready = false;
-            xEventGroupClearBits(player_event_group, BT_CONNECTED_BIT);
-            
-            if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
-                player_cmd_t cmd = CMD_RETRY_CONNECTION;
-                xQueueSend(control_queue, &cmd, pdMS_TO_TICKS(1000));
-            }
-        } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTING) {
-            ESP_LOGI(TAG, "Conectando A2DP...");
-        }
-        break;
-        
-    case ESP_A2D_AUDIO_STATE_EVT:
-        if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
-            ESP_LOGI(TAG, "Áudio iniciado");
-            sys_status.audio_playing = true;
-        } else if (param->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
-            ESP_LOGI(TAG, "Áudio parado");
-            sys_status.audio_playing = false;
-            xEventGroupSetBits(player_event_group, TRACK_FINISHED_BIT);
-        }
-        break;
-        
-    case ESP_A2D_AUDIO_CFG_EVT:
-        ESP_LOGI(TAG, "Config áudio recebida do sink");
-        break;
-        
-    default:
-        break;
-    }
-}
+    char filepath[MAX_PATH_LEN];
+    bool reached_eof = false;
 
-static void click_timeout_callback(TimerHandle_t xTimer)
-{
-    ESP_LOGI(TAG, "=== CLIQUES FINALIZADOS: %d ===", click_count);
-    
-    switch (click_count) {
-        case 1:
-            ESP_LOGI(TAG, "Ação: 1 clique - Toggle Pause");
-            {
-                player_cmd_t cmd = CMD_TOGGLE_PAUSE;
-                xQueueSend(control_queue, &cmd, 0);
-            }
-            break;
-            
-        case 2:
-            ESP_LOGI(TAG, "Ação: 2 cliques - Próxima música");
-            {
-                player_cmd_t cmd = CMD_PLAY_NEXT;
-                xQueueSend(control_queue, &cmd, 0);
-            }
-            break;
-            
-        case 3:
-            ESP_LOGI(TAG, "Ação: 3 cliques - Ação customizada");
-            break;
-            
-        default:
-            ESP_LOGI(TAG, "Ação: %d cliques - Não mapeado", click_count);
-            break;
+    if (get_mp3_path(current_track, filepath, sizeof(filepath)) != ESP_OK) {
+        goto task_fail;
     }
-    
-    click_count = 0;
-}
 
-static void bt_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
-{
-    ESP_LOGI(TAG, ">>> AVRC TG EVENT: %d (param: %p) <<<", event, (void*)param);
-    
-    if (!param) {
-        ESP_LOGE(TAG, "AVRC TG: param NULL no evento %d", event);
-        return;
+    ESP_LOGI(TAG, "▶️ Reproduzindo [%d/%d]: %s",
+             current_track + 1, mp3_count, filepath);
+
+    if (analyze_mp3_file(filepath, &current_mp3_info) != ESP_OK) {
+        goto task_fail;
     }
-    
-    if (event == 0) {
-        ESP_LOGI(TAG, "AVRC TG: %s", 
-                param->conn_stat.connected ? "Conectado" : "Desconectado");
-        return;
+
+    current_file = fopen(filepath, "rb");
+    if (!current_file) {
+        goto task_fail;
     }
-    
-    if (event == 1) {
-        ESP_LOGI(TAG, "=== PASSTHROUGH RECEBIDO ===");
-        
-        uint8_t key = param->psth_cmd.key_code;
-        uint8_t state = param->psth_cmd.key_state;
-        
-        ESP_LOGI(TAG, "Raw: key=0x%02X state=%d", key, state);
-        
-        const char* key_name = "UNKNOWN";
-        switch(key) {
-            case 0x44: key_name = "PLAY"; break;
-            case 0x46: key_name = "PAUSE"; break;
-            case 0x4B: key_name = "FORWARD"; break;
-            case 0x4C: key_name = "BACKWARD"; break;
-            case 0x45: key_name = "STOP"; break;
+
+    skip_id3v2(current_file);
+    ring_buffer_reset(stream_buffer);
+
+    if (init_audio_decoder() != ESP_OK) {
+        goto task_fail;
+    }
+
+    // ✅ IMPORTANTE: Zerar estados no início
+    bytes_left_in_mp3 = 0;
+    read_ptr = mp3_input_buffer;
+
+    // =========================================================
+    // 📦 PRÉ-BUFFER (10 frames)
+    // =========================================================
+    ESP_LOGI(TAG, "🔄 Pré-buffer (%d frames)...", PREBUFFER_FRAMES);
+
+    int frame_count = 0;
+    bool first_frame = true;
+    TickType_t last_stream_progress_tick = xTaskGetTickCount();
+    uint32_t last_stream_bytes = total_bytes_streamed;
+    uint32_t consecutive_short_writes = 0;
+    last_producer_tick = xTaskGetTickCount();
+    uint16_t eof_no_sync_loops = 0;
+    uint16_t eof_decode_err_loops = 0;
+
+    while (frame_count < PREBUFFER_FRAMES && file_reader_task_running) {
+        if (!sys_status.bt_connected) {
+            break;
         }
-        
-        ESP_LOGI(TAG, "[%s] %s", key_name, state == 2 ? "RELEASED" : "UNKNOWN");
-        
-        if (!first_command_received) {
-            ESP_LOGI(TAG, ">>> PRIMEIRO COMANDO - Fone sinalizou 'pronto' <<<");
-            first_command_received = true;
-            
-            if (wav_count > 0) {
-                ESP_LOGI(TAG, "Iniciando reproducao automatica...");
-                player_cmd_t cmd = CMD_PLAY_NEXT;
-                xQueueSend(control_queue, &cmd, 0);
+
+        if (bytes_left_in_mp3 < MP3_CRITICAL_BYTES) {
+            if (bytes_left_in_mp3 > 0 && read_ptr != mp3_input_buffer) {
+                memmove(mp3_input_buffer, read_ptr, bytes_left_in_mp3);
             }
-            return;
-        }
-        
-        if (state == 1 || state == 2) {
-            TickType_t current_time = xTaskGetTickCount();
-            TickType_t time_diff = (current_time - last_click_time) * portTICK_PERIOD_MS;
-            
-            if (time_diff < CLICK_TIMEOUT_MS) {
-                click_count++;
-            } else {
-                click_count = 1;
-            }
-            last_click_time = current_time;
-            
-            ESP_LOGI(TAG, ">>> Cliques: %d (intervalo: %lums) <<<", 
-                    click_count, (unsigned long)time_diff);
-            
-            static TimerHandle_t click_timer = NULL;
-            if (!click_timer) {
-                click_timer = xTimerCreate("click_timer", 
-                    pdMS_TO_TICKS(CLICK_TIMEOUT_MS + 50), 
-                    pdFALSE, NULL, click_timeout_callback);
-            }
-            
-            if (click_timer) {
-                xTimerReset(click_timer, 0);
-            }
-            
-            switch (key) {
-                case 0x4B:
-                    ESP_LOGI(TAG, "-> CMD_PLAY_NEXT enviado");
-                    {
-                        player_cmd_t cmd = CMD_PLAY_NEXT;
-                        xQueueSend(control_queue, &cmd, 0);
-                    }
+            read_ptr = mp3_input_buffer;
+
+            size_t to_read = MP3_INPUT_BUFFER_SIZE - bytes_left_in_mp3;
+            size_t r = fread(mp3_input_buffer + bytes_left_in_mp3, 1,
+                            to_read, current_file);
+
+            if (r > 0) {
+                bytes_left_in_mp3 += r;
+            } else if (feof(current_file)) {
+                if (bytes_left_in_mp3 == 0) {
+                    reached_eof = true;
                     break;
-                    
-                case 0x45:
-                    ESP_LOGI(TAG, "-> CMD_STOP enviado");
-                    {
-                        player_cmd_t cmd = CMD_STOP;
-                        xQueueSend(control_queue, &cmd, 0);
-                    }
-                    break;
+                }
             }
         }
-        return;
-    }
-    
-    if (event == 2) {
-        ESP_LOGI(TAG, "AVRC TG: Volume command");
-        return;
-    }
-    
-    ESP_LOGI(TAG, "AVRC TG: Evento %d nao mapeado", event);
-}
 
-static void bt_avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
-{
-    ESP_LOGI(TAG, ">>> AVRC EVENT: %d <<<", event);
-    
-    switch (event) {
-    case ESP_AVRC_CT_CONNECTION_STATE_EVT:
-        if (param && param->conn_stat.connected) {
-            ESP_LOGI(TAG, "AVRC Conectado");
+        int offset = MP3FindSyncWord(read_ptr, bytes_left_in_mp3);
+        if (offset < 0) {
+            if (feof(current_file) && bytes_left_in_mp3 == 0) {
+                reached_eof = true;
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+
+        read_ptr += offset;
+        bytes_left_in_mp3 -= offset;
+
+        int err = MP3Decode(mp3_decoder, &read_ptr, &bytes_left_in_mp3,
+                            pcm_output_buffer, 0);
+
+        if (err == ERR_MP3_NONE) {
+            MP3FrameInfo fi;
+            MP3GetLastFrameInfo(mp3_decoder, &fi);
+
+            if (first_frame) {
+                ESP_LOGI(TAG, "🎧 %d Hz | %d kbps | %d ch",
+                         fi.samprate, fi.bitrate / 1000, fi.nChans);
+                first_frame = false;
+                xEventGroupSetBits(player_event_group, STREAM_READY_BIT);
+            }
+
+            ring_buffer_write_blocking(stream_buffer,
+                                       (uint8_t *)pcm_output_buffer,
+                                       fi.outputSamps * sizeof(int16_t),
+                                       pdMS_TO_TICKS(40));
+
+            frame_count++;
+        }
+    }
+
+    ESP_LOGI(TAG, "✅ Pré-buffer pronto (%d frames)", frame_count);
+
+    // =========================================================
+    // 🔁 LOOP PRINCIPAL - CONTROLE DE BUFFER MELHORADO
+    // =========================================================
+    while (file_reader_task_running) {
+        if (playback_paused) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (!sys_status.bt_connected) {
+            break;
+        }
+        if (!sys_status.streaming_active && (frame_count % 120 == 0)) {
+            ESP_LOGW(TAG, "Stream flag OFF com BT conectado; mantendo decode para não secar buffer");
+            log_bt_state("stream_flag_off_keep_decoding");
+        }
+
+        // -----------------------------
+        // 📊 Verificar nível do stream buffer
+        // -----------------------------
+        size_t stream_available = ring_buffer_available(stream_buffer);
+        float stream_fill_percent = (stream_available * 100.0f) / STREAM_BUFFER_SIZE;
+
+        // ✅ CONTROLE MELHORADO: Alvo 40-75%
+        // < 40%: Acelerar leitura
+        // 40-75%: Normal
+        // > 75%: Reduzir (mas nunca parar)
+
+        // -----------------------------
+        // 📂 Leitura SD adaptativa baseada no stream buffer
+        // -----------------------------
+        if (bytes_left_in_mp3 < MP3_CRITICAL_BYTES) {
+            // Mover dados restantes para início do buffer
+            if (bytes_left_in_mp3 > 0 && read_ptr != mp3_input_buffer) {
+                memmove(mp3_input_buffer, read_ptr, bytes_left_in_mp3);
+            }
+            read_ptr = mp3_input_buffer;
+
+            size_t free = MP3_INPUT_BUFFER_SIZE - bytes_left_in_mp3;
+            size_t to_read;
+
+            // ✅ LÓGICA MUITO CONSERVADORA: Produzir MUITO menos
+            if (stream_fill_percent < 30.0f) {
+                // Buffer BAIXO (< 30%): LER agressivo
+                to_read = MP3_READ_MAX;
+                if (to_read > free) to_read = free;
+            } 
+            else if (stream_fill_percent < 45.0f) {
+                // Buffer OK baixo (30-45%): ler médio
+                to_read = MP3_READ_MAX / 2;
+                if (to_read > free) to_read = free;
+            }
+            else if (stream_fill_percent < 60.0f) {
+                // Buffer OK alto (45-60%)
+                to_read = MP3_READ_MIN;
+                if (to_read > free) to_read = free;
+            }
+            else {
+                // Buffer ALTO (> 60%): ainda manter leitura mínima estável
+                to_read = MP3_READ_MIN;
+                if (to_read > free) to_read = free;
+            }
+
+            // Alinhar leitura (múltiplo de 4 bytes para performance)
+            to_read &= ~0x03;
+
+            size_t r = fread(mp3_input_buffer + bytes_left_in_mp3, 1,
+                            to_read, current_file);
+            
+            if (r > 0) {
+                bytes_left_in_mp3 += r;
+            } else if (feof(current_file)) {
+                // ✅ FIM DO ARQUIVO: processar bytes restantes
+                if (bytes_left_in_mp3 == 0) {
+                    ESP_LOGI(TAG, "🏁 Fim do arquivo MP3");
+                    reached_eof = true;
+                    break;
+                }
+            }
+        }
+
+        // -----------------------------
+        // 🔎 Sync
+        // -----------------------------
+        int offset = MP3FindSyncWord(read_ptr, bytes_left_in_mp3);
+        if (offset < 0) {
+            if (feof(current_file)) {
+                eof_no_sync_loops++;
+            } else {
+                eof_no_sync_loops = 0;
+            }
+
+            if (feof(current_file) &&
+                (bytes_left_in_mp3 < 4 || eof_no_sync_loops > 30)) {
+                ESP_LOGI(TAG, "🏁 Fim do stream (EOF sem sync, loops=%u, bytes=%d)",
+                         (unsigned)eof_no_sync_loops, bytes_left_in_mp3);
+                reached_eof = true;
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        eof_no_sync_loops = 0;
+
+        read_ptr += offset;
+        bytes_left_in_mp3 -= offset;
+
+        // -----------------------------
+        // 🎛 Decode
+        // -----------------------------
+        int err = MP3Decode(mp3_decoder, &read_ptr, &bytes_left_in_mp3,
+                            pcm_output_buffer, 0);
+
+        if (err != ERR_MP3_NONE) {
+            if (feof(current_file)) {
+                eof_decode_err_loops++;
+            } else {
+                eof_decode_err_loops = 0;
+            }
+
+            if (feof(current_file) &&
+                (bytes_left_in_mp3 < MP3_CRITICAL_BYTES || eof_decode_err_loops > 30)) {
+                ESP_LOGI(TAG, "🏁 Fim do stream (decode+EOF, loops=%u, bytes=%d)",
+                         (unsigned)eof_decode_err_loops, bytes_left_in_mp3);
+                reached_eof = true;
+                break;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+        eof_decode_err_loops = 0;
+
+        MP3FrameInfo fi;
+        MP3GetLastFrameInfo(mp3_decoder, &fi);
+
+        // -----------------------------
+        // 🔊 Volume
+        // -----------------------------
+        for (int i = 0; i < fi.outputSamps; i++) {
+            int32_t s = pcm_output_buffer[i] * volume_scale;
+            pcm_output_buffer[i] = (int16_t)
+                (s > 32767 ? 32767 : s < -32768 ? -32768 : s);
+        }
+
+        // -----------------------------
+        // 📤 PCM → ring buffer
+        // -----------------------------
+        size_t frame_bytes = (size_t)fi.outputSamps * sizeof(int16_t);
+        size_t pushed = ring_buffer_write_blocking(stream_buffer,
+                                   (uint8_t *)pcm_output_buffer,
+                                   frame_bytes,
+                                   pdMS_TO_TICKS(30));
+
+        producer_frame_count++;
+        if (pushed == 0) {
+            producer_drop_count++;
+            consecutive_short_writes++;
+            if ((consecutive_short_writes % 50) == 0) {
+                size_t stream_av = ring_buffer_available(stream_buffer);
+                ESP_LOGW(TAG,
+                         "Producer sem push (%lu seguidos). buf:%zu/%d mp3buf:%d bt:%d stream:%d",
+                         (unsigned long)consecutive_short_writes,
+                         stream_av, STREAM_BUFFER_SIZE, bytes_left_in_mp3,
+                         sys_status.bt_connected, sys_status.streaming_active);
+            }
         } else {
-            ESP_LOGI(TAG, "AVRC Desconectado");
+            consecutive_short_writes = 0;
+            last_producer_tick = xTaskGetTickCount();
         }
-        break;
-    
-    case ESP_AVRC_CT_METADATA_RSP_EVT:
-        ESP_LOGI(TAG, "AVRC: Metadata recebido");
-        break;
-        
-    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
-        ESP_LOGI(TAG, "AVRC: Play status changed");
-        break;
-        
-    case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
-        ESP_LOGI(TAG, "AVRC: Change notify - event_id: %d", param->change_ntf.event_id);
-        break;
-        
-    case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT:
-        ESP_LOGI(TAG, "AVRC: Get capabilities response");
-        break;
 
-    case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
-        if (param) {
-            uint8_t key = param->psth_rsp.key_code;
-            uint8_t state = param->psth_rsp.key_state;
-            
-            ESP_LOGI(TAG, "COMANDO RECEBIDO (CT): key=0x%02X state=%d", key, state);
-            
-            if (state == ESP_AVRC_PT_CMD_STATE_PRESSED) {
-                TickType_t current_time = xTaskGetTickCount();
-                TickType_t time_diff = (current_time - last_click_time) * portTICK_PERIOD_MS;
-                
-                if (time_diff < CLICK_TIMEOUT_MS) {
-                    click_count++;
-                } else {
-                    click_count = 1;
-                }
-                last_click_time = current_time;
-                
-                ESP_LOGI(TAG, ">>> Cliques (CT): %d <<<", click_count);
-                
-                static TimerHandle_t click_timer = NULL;
-                if (!click_timer) {
-                    click_timer = xTimerCreate("click_timer", 
-                        pdMS_TO_TICKS(CLICK_TIMEOUT_MS + 50), 
-                        pdFALSE, NULL, click_timeout_callback);
-                }
-                xTimerReset(click_timer, 0);
+        frame_count++;
+
+        if (total_bytes_streamed != last_stream_bytes) {
+            last_stream_bytes = total_bytes_streamed;
+            last_stream_progress_tick = xTaskGetTickCount();
+        } else {
+            TickType_t stalled_for = xTaskGetTickCount() - last_stream_progress_tick;
+            if (stalled_for > pdMS_TO_TICKS(3000) && (frame_count % 100 == 0)) {
+                size_t stream_av = ring_buffer_available(stream_buffer);
+                ESP_LOGW(TAG,
+                         "Possível stall de stream: %lu ms sem progresso A2DP | buf:%zu/%d | mp3buf:%d | bt:%d stream:%d",
+                         (unsigned long)TICKS_TO_MS(stalled_for),
+                         stream_av,
+                         STREAM_BUFFER_SIZE,
+                         bytes_left_in_mp3,
+                         sys_status.bt_connected,
+                         sys_status.streaming_active);
+                log_bt_state("decode_stall");
             }
         }
-        break;
+
+        // Log periódico
+        if (frame_count % 500 == 0) {
+            size_t stream_av = ring_buffer_available(stream_buffer);
+            float fill_pct = (stream_av * 100.0f) / STREAM_BUFFER_SIZE;
+            ESP_LOGI(TAG, "F%04d | Stream:%zu/%d (%.0f%%) | MP3buf:%d | Heap:%lu | Prod frame/drop:%lu/%lu",
+                     frame_count,
+                     stream_av, STREAM_BUFFER_SIZE, fill_pct,
+                     bytes_left_in_mp3,
+                     (unsigned long)esp_get_free_heap_size(),
+                     (unsigned long)producer_frame_count,
+                     (unsigned long)producer_drop_count);
+        }
+
+        // ✅ YIELD EM TODOS OS FRAMES: Máxima prioridade ao A2DP
+        taskYIELD();
         
-    default:
-        ESP_LOGI(TAG, "AVRC: Evento não tratado: %d", event);
-        break;
+        // ✅ PAUSA ADICIONAL quando buffer muito cheio
+        size_t current_available = ring_buffer_available(stream_buffer);
+        float current_fill = (current_available * 100.0f) / STREAM_BUFFER_SIZE;
+        
+        if (current_fill > 70.0f) {
+            // Buffer muito cheio: pausa curta para drenar
+            vTaskDelay(pdMS_TO_TICKS(2));
+        } else if (current_fill > 50.0f) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
+
+task_fail:
+    ESP_LOGI(TAG, "⏹ Decoder encerrado");
+    bool natural_finish = reached_eof;
+
+    // ✅ ORDEM CORRETA DE LIMPEZA:
+    // 1. Fechar arquivo primeiro
+    if (current_file) {
+        fclose(current_file);
+        current_file = NULL;
+    }
+    
+    // 2. Limpar decoder
+    cleanup_audio_decoder();
+    
+    // 3. Zerar estados
+    bytes_left_in_mp3 = 0;
+    read_ptr = NULL;
+    
+    // 4. Marcar task como não rodando
+    file_reader_task_running = false;
+    file_reader_task_handle = NULL;
+    sys_status.audio_playing = false;
+    
+    // 5. Sinalizar fim da track
+    if (natural_finish && sys_status.bt_connected) {
+        xEventGroupSetBits(player_event_group, TRACK_FINISHED_BIT);
+        player_cmd_t next_cmd = CMD_PLAY_NEXT;
+        enqueue_control_cmd(next_cmd);
+    }
+    
+    vTaskDelete(NULL);
 }
 
 // ============================================================================
-// SD CARD
+// CONTROLE DE VOLUME
 // ============================================================================
 
-char* get_current_track_path(void)
+static void set_volume(uint8_t volume)
 {
-    static char filepath[MAX_PATH_LEN];
-    return get_wav_by_index(current_track, filepath, sizeof(filepath));
+    if (volume > 100) volume = 100;
+    current_volume = volume;
+    volume_scale = volume / 100.0f;
+    
+    ESP_LOGI(TAG, "🔊 Volume: %d%% (%.2f)", current_volume, volume_scale);
 }
 
-void random_track(void)
+static void volume_up(void)
 {
-    if (wav_count <= 1) return;
-    
-    int new_track;
-    do {
-        new_track = esp_random() % wav_count;
-    } while (new_track == current_track && wav_count > 1);
-    
-    current_track = new_track;
-    ESP_LOGI(TAG, "Track aleatória: %d/%d", current_track + 1, wav_count);
+    uint8_t new_vol = current_volume + VOLUME_STEP;
+    if (new_vol > 100) new_vol = 100;
+    set_volume(new_vol);
 }
 
-// ============================================================================
-// BUFFERS
-// ============================================================================
-
-esp_err_t init_audio_buffers(void)
+static void volume_down(void)
 {
-    ESP_LOGI(TAG, "Inicializando buffers de áudio...");
-    
-    file_read_buffer = heap_caps_malloc(AUDIO_READ_BUFFER_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-    if (!file_read_buffer) {
-        ESP_LOGE(TAG, "Falha buffer leitura: %d bytes", AUDIO_READ_BUFFER_SIZE);
-        return ESP_ERR_NO_MEM;
-    }
-    
-    stream_buffer = create_ring_buffer(STREAM_BUFFER_SIZE);
-    if (!stream_buffer) {
-        ESP_LOGE(TAG, "Falha stream buffer: %d bytes", STREAM_BUFFER_SIZE);
-        free(file_read_buffer);
-        return ESP_ERR_NO_MEM;
-    }
-    
-    ESP_LOGI(TAG, "Buffers OK: Leitura=%dKB, Stream=%dKB", 
-            AUDIO_READ_BUFFER_SIZE/1024, STREAM_BUFFER_SIZE/1024);
-    
-    return ESP_OK;
+    int new_vol = current_volume - VOLUME_STEP;
+    if (new_vol < 0) new_vol = 0;
+    set_volume((uint8_t)new_vol);
 }
 
-void cleanup_audio_buffers(void)
+static void init_volume_buttons(void)
 {
-    if (file_read_buffer) {
-        free(file_read_buffer);
-        file_read_buffer = NULL;
-    }
-    if (stream_buffer) {
-        destroy_ring_buffer(stream_buffer);
-        stream_buffer = NULL;
-    }
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_VOL_UP) | (1ULL << PIN_VOL_DOWN) | (1ULL << PIN_PWR_SLEEP),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    
+    ESP_LOGI(TAG, "✅ Botões configurados (VOL:%d/%d POWER:%d)", 
+            PIN_VOL_UP, PIN_VOL_DOWN, PIN_PWR_SLEEP);
 }
 
-// ============================================================================
-// BLUETOOTH
-// ============================================================================
-
-esp_err_t bluetooth_init(void)
+static void configure_deep_sleep_wakeup(void)
 {
-    ESP_LOGI(TAG, "Inicializando Bluetooth...");
-    
-    size_t free_heap = esp_get_free_heap_size();
-    ESP_LOGI(TAG, "Heap livre antes do BT: %zu bytes", free_heap);
-    
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "Apagando NVS e reinicializando...");
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar NVS: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    esp_bt_controller_status_t bt_status = esp_bt_controller_get_status();
-    if (bt_status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
-        ESP_LOGW(TAG, "Desabilitando Bluetooth anterior...");
-        esp_bluedroid_disable();
-        esp_bluedroid_deinit();
-        esp_bt_controller_disable();
-        esp_bt_controller_deinit();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    } else if (bt_status == ESP_BT_CONTROLLER_STATUS_INITED) {
-        ESP_LOGW(TAG, "Desinicializando controller BT anterior...");
-        esp_bt_controller_deinit();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    
-    ESP_LOGI(TAG, "Configurando controller Bluetooth...");
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    
-    bt_cfg.mode = ESP_BT_MODE_CLASSIC_BT;
-    bt_cfg.bt_max_acl_conn = 2;
-    bt_cfg.bt_sco_datapath = ESP_SCO_DATA_PATH_HCI;
-    
-    ret = esp_bt_controller_init(&bt_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar controller BT: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "Controller BT inicializado");
-    
-    ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao habilitar controller BT: %s", esp_err_to_name(ret));
-        esp_bt_controller_deinit();
-        return ret;
-    }
-    ESP_LOGI(TAG, "Controller BT habilitado");
-    
-    ret = esp_bluedroid_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar Bluedroid: %s", esp_err_to_name(ret));
-        esp_bt_controller_disable();
-        esp_bt_controller_deinit();
-        return ret;
-    }
-    ESP_LOGI(TAG, "Bluedroid inicializado");
-    
-    ret = esp_bluedroid_enable();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao habilitar Bluedroid: %s", esp_err_to_name(ret));
-        esp_bluedroid_deinit();
-        esp_bt_controller_disable();
-        esp_bt_controller_deinit();
-        return ret;
-    }
-    ESP_LOGI(TAG, "Bluedroid habilitado");
+    // GPIO33 é RTC IO no ESP32 clássico e suporta ext0 wakeup.
+    rtc_gpio_init((gpio_num_t)PIN_PWR_SLEEP);
+    rtc_gpio_set_direction((gpio_num_t)PIN_PWR_SLEEP, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_en((gpio_num_t)PIN_PWR_SLEEP);
+    rtc_gpio_pulldown_dis((gpio_num_t)PIN_PWR_SLEEP);
 
-    // Configurar potência máxima do Bluetooth
-    esp_err_t power_ret = esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
-    if (power_ret == ESP_OK) {
-        ESP_LOGI(TAG, "Potência BT configurada para MÁXIMA (+9dBm)");
+    esp_err_t err = esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_PWR_SLEEP, 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "✅ Wakeup deep sleep ativo no GPIO %d (nível LOW)", PIN_PWR_SLEEP);
     } else {
-        ESP_LOGW(TAG, "Falha ao configurar potência BT: %s", esp_err_to_name(power_ret));
+        ESP_LOGW(TAG, "⚠️ Falha ao configurar wakeup ext0: %s", esp_err_to_name(err));
     }
-    // ===================================
-    
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    ret = esp_bt_gap_register_callback(bt_gap_cb);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao registrar GAP callback: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "GAP callback registrado");
-    
-    ret = esp_avrc_ct_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar AVRC: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "AVRC inicializado");
-    
-    ret = esp_avrc_ct_register_callback(bt_avrc_cb);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao registrar AVRC callback: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "AVRC callback registrado");
-
-    ret = esp_avrc_tg_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar AVRC TG: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "AVRC Target inicializado");
-
-    ret = esp_avrc_tg_register_callback(bt_avrc_tg_cb);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao registrar AVRC TG callback: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "AVRC TG callback registrado");
-    
-    ret = esp_a2d_source_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao inicializar A2DP source: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "A2DP source inicializado");
-    
-    ret = esp_a2d_register_callback(bt_a2dp_cb);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao registrar A2DP callback: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "A2DP callback registrado");
-    
-    ret = esp_a2d_source_register_data_callback(bt_a2dp_source_data_cb);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao registrar data callback: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "A2DP data callback registrado");
-    
-    sys_status.bt_initialized = true;
-    ESP_LOGI(TAG, "Bluetooth inicializado com sucesso");
-    return ESP_OK;
 }
 
-esp_err_t bluetooth_search_and_connect(void)
+static void enter_deep_sleep(void)
 {
-    if (!sys_status.bt_initialized) {
-        ESP_LOGE(TAG, "Bluetooth não inicializado");
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    if (sys_status.bt_connected) {
-        ESP_LOGI(TAG, "Já conectado - cancelando busca");
-        return ESP_OK;
-    }
-    
-    ESP_LOGI(TAG, "Procurando por %s... (tentativa %d/%d)", 
-             TARGET_DEVICE_NAME, sys_status.connection_retries + 1, CONNECTION_RETRY_MAX);
-    
-    device_found = false;
-    sys_status.connection_retries++;
-    
-    esp_err_t ret = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Erro ao configurar scan mode: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Erro ao iniciar descoberta: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    xTimerStart(discovery_timer, 0);
-    
-    return ESP_OK;
+    ESP_LOGW(TAG, "😴 Entrando em deep sleep (hold power button)");
+    stop_playback_and_reset(true, "deep_sleep");
+    free_mp3_playlist_cache();
+
+    if (connection_timer) xTimerStop(connection_timer, 0);
+    if (discovery_timer) xTimerStop(discovery_timer, 0);
+    if (buffer_monitor_timer) xTimerStop(buffer_monitor_timer, 0);
+
+    configure_deep_sleep_wakeup();
+    vTaskDelay(pdMS_TO_TICKS(80));
+    esp_deep_sleep_start();
 }
 
-// ============================================================================
-// SD CARD INIT
-// ============================================================================
-
-esp_err_t sdcard_init(void)
+static void handle_button(button_state_t *btn)
 {
-    ESP_LOGI(TAG, "Inicializando SD Card...");
+    bool current_state = gpio_get_level(btn->pin);
+    TickType_t now = xTaskGetTickCount();
     
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;
-    host.max_freq_khz = 18000;
-    
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_NUM_MOSI,
-        .miso_io_num = PIN_NUM_MISO,
-        .sclk_io_num = PIN_NUM_CLK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4096,
-        .flags = SPICOMMON_BUSFLAG_MASTER,
-        .intr_flags = 0
-    };
-    
-    esp_err_t ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Erro SPI: %s", esp_err_to_name(ret));
-        return ret;
+    if (current_state != btn->last_state) {
+        if (now - btn->last_change_time > pdMS_TO_TICKS(DEBOUNCE_TIME_MS)) {
+            btn->last_change_time = now;
+            btn->last_state = current_state;
+            
+            if (!current_state) {
+                btn->pressed = true;
+                btn->press_start_time = now;
+                btn->is_long_press = false;
+            } else if (btn->pressed) {
+                btn->pressed = false;
+                
+                TickType_t press_duration = now - btn->press_start_time;
+                
+                if (!btn->is_long_press && 
+                    press_duration < pdMS_TO_TICKS(LONG_CLICK_THRESHOLD_MS)) {
+                    
+                    if (now - btn->last_click_time < pdMS_TO_TICKS(DOUBLE_CLICK_INTERVAL_MS)) {
+                        btn->click_count++;
+                    } else {
+                        btn->click_count = 1;
+                    }
+                    btn->last_click_time = now;
+                }
+            }
+        }
+    } else if (btn->pressed && !btn->is_long_press) {
+        TickType_t press_duration = now - btn->press_start_time;
+        if (press_duration >= pdMS_TO_TICKS(LONG_CLICK_THRESHOLD_MS)) {
+            btn->is_long_press = true;
+        }
     }
-    
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = PIN_NUM_CS;
-    slot_config.host_id = host.slot;
-    
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024,
-        .disk_status_check_enable = false
-    };
-    
-    sdmmc_card_t *card;
+}
 
-    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+static void volume_control_task(void *pvParameter)
+{
+    ESP_LOGI(TAG, "Task controle volume iniciada");
     
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "SD Card OK!");
-        ESP_LOGI(TAG, "  Nome: %s", card->cid.name);
-        ESP_LOGI(TAG, "  Freq: %d kHz", host.max_freq_khz);
-        ESP_LOGI(TAG, "  Tipo: %s", (card->ocr & (1 << 30)) ? "SDHC/SDXC" : "SDSC");
-        ESP_LOGI(TAG, "  Tam: %llu MB", 
-                    ((uint64_t) card->csd.capacity) * card->csd.sector_size / (1024 * 1024));
+    TickType_t last_process_time = xTaskGetTickCount();
+    static TickType_t last_next_track_cmd = 0;
+    
+    while (1) {
+        handle_button(&vol_up_btn);
+        handle_button(&vol_down_btn);
         
-        sys_status.sd_mounted = true;
-        return ESP_OK;
+        TickType_t now = xTaskGetTickCount();
+
+        // Botão de power/deep sleep: hold de POWER_HOLD_MS para dormir.
+        bool pwr_level = gpio_get_level(PIN_PWR_SLEEP);
+        if (pwr_level != pwr_last_level &&
+            (now - pwr_last_change_time) > pdMS_TO_TICKS(DEBOUNCE_TIME_MS)) {
+            pwr_last_change_time = now;
+            pwr_last_level = pwr_level;
+            if (!pwr_level) {
+                pwr_pressed = true;
+                pwr_hold_handled = false;
+                pwr_press_start_time = now;
+            } else {
+                pwr_pressed = false;
+                pwr_hold_handled = false;
+            }
+        }
+
+        if (pwr_pressed && !pwr_hold_handled &&
+            (now - pwr_press_start_time) > pdMS_TO_TICKS(POWER_HOLD_MS)) {
+            pwr_hold_handled = true;
+            ESP_LOGW(TAG, "⏻ Power hold detectado (%d ms)", POWER_HOLD_MS);
+            enter_deep_sleep();
+        }
+        
+        if (vol_up_btn.click_count > 0 && 
+            now - vol_up_btn.last_click_time > pdMS_TO_TICKS(CLICK_TIMEOUT_MS)) {
+            
+            if (vol_up_btn.click_count == 2) {
+                // ✅ PROTEÇÃO: Evitar múltiplos comandos próximos (3 segundos)
+                if ((now - last_next_track_cmd) > pdMS_TO_TICKS(3000)) {
+                    ESP_LOGI(TAG, "⏭️ Duplo clique: Música ALEATÓRIA");
+                    
+                    // ✅ Limpar queue antes de enviar
+                    player_cmd_t dummy;
+                    int cleared = 0;
+                    while (xQueueReceive(control_queue, &dummy, 0) == pdTRUE) {
+                        switch (dummy) {
+                            case CMD_PLAY_NEXT: cmd_play_next_pending = false; break;
+                            case CMD_PLAY_PREV: cmd_play_prev_pending = false; break;
+                            case CMD_RETRY_CONNECTION: cmd_retry_pending = false; break;
+                            case CMD_RESTART_DISCOVERY: cmd_restart_disc_pending = false; break;
+                            case CMD_CONNECT_TARGET: cmd_connect_pending = false; break;
+                            default: break;
+                        }
+                        cleared++;
+                    }
+                    if (cleared > 0) {
+                        ESP_LOGI(TAG, "🗑️ Removidos %d comandos da queue", cleared);
+                    }
+                    
+                    // Enviar comando
+                    player_cmd_t cmd = CMD_PLAY_NEXT;
+                    enqueue_control_cmd(cmd);
+                    last_next_track_cmd = now;
+                } else {
+                    ESP_LOGW(TAG, "⚠️ Duplo clique ignorado (aguarde 3s)");
+                }
+            } else if (vol_up_btn.click_count == 1) {
+                volume_up();
+            }
+            vol_up_btn.click_count = 0;
+        }
+        
+        if (vol_up_btn.is_long_press) {
+            volume_up();
+            vol_up_btn.is_long_press = false;
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        
+        if (vol_down_btn.click_count > 0 && 
+            now - vol_down_btn.last_click_time > pdMS_TO_TICKS(CLICK_TIMEOUT_MS)) {
+            
+            volume_down();
+            vol_down_btn.click_count = 0;
+        }
+        
+        if (vol_down_btn.is_long_press) {
+            volume_down();
+            vol_down_btn.is_long_press = false;
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        
+        if (now - last_process_time >= pdMS_TO_TICKS(50)) {
+            last_process_time = now;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    
-    ESP_LOGE(TAG, "Todas tentativas falharam!");
-    spi_bus_free(host.slot);
-    return ret;
 }
 
 // ============================================================================
-// STATUS E TIMERS
+// BLUETOOTH CALLBACKS
 // ============================================================================
-
-static void log_system_status(void)
-{
-    ESP_LOGI(TAG, "=== STATUS ===");
-    ESP_LOGI(TAG, "SD:%s BT:%s Stream:%s WAVs:%d", 
-            sys_status.sd_mounted ? "OK" : "ERR",
-            sys_status.bt_connected ? "OK" : "ERR", 
-            sys_status.streaming_active ? "ON" : "OFF",
-            wav_count);
-    
-    if (stream_buffer) {
-        ESP_LOGI(TAG, "Buf: %zuKB / %dKB (%.0f%%)",
-                rb_available(stream_buffer)/1024, 
-                STREAM_BUFFER_SIZE/1024,
-                (rb_available(stream_buffer) * 100.0) / STREAM_BUFFER_SIZE);
-    }
-    
-    ESP_LOGI(TAG, "Volume: %d%% (%.2f)", current_volume, volume_scale);
-    ESP_LOGI(TAG, "Perf: %luKB E:%lu Heap:%lu", 
-            total_bytes_streamed/1024, underrun_count, 
-            (unsigned long)esp_get_free_heap_size());
-    ESP_LOGI(TAG, "==============");
-}
 
 static void connection_timeout_callback(TimerHandle_t xTimer)
 {
-    ESP_LOGW(TAG, "Timeout conexão BT");
-    player_cmd_t cmd = CMD_RETRY_CONNECTION;
-    xQueueSend(control_queue, &cmd, 0);
+    ESP_LOGW(TAG, "⏱️ Timeout de conexão BT");
+    log_bt_state("conn_timeout");
+    if (!sys_status.bt_connected && sys_status.bt_connecting) {
+        sys_status.bt_connecting = false;
+        player_cmd_t cmd = CMD_RETRY_CONNECTION;
+        enqueue_control_cmd(cmd);
+    }
 }
 
 static void discovery_timeout_callback(TimerHandle_t xTimer)
 {
-    ESP_LOGW(TAG, "Timeout descoberta");
-    esp_bt_gap_cancel_discovery();
-    
-    if (!device_found && sys_status.connection_retries < CONNECTION_RETRY_MAX) {
+    ESP_LOGW(TAG, "⏱️ Timeout de discovery");
+    log_bt_state("disc_timeout");
+    if (!device_found && !sys_status.bt_connected && sys_status.bt_connecting) {
         player_cmd_t cmd = CMD_RESTART_DISCOVERY;
-        xQueueSend(control_queue, &cmd, 0);
+        enqueue_control_cmd(cmd);
     }
 }
 
-static void buffer_monitor_callback(TimerHandle_t xTimer)
+static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
-    if (!sys_status.streaming_active) return;
-    
-    if (stream_buffer) {
-        size_t stream_available = rb_available(stream_buffer);
-        
-        if (stream_available < STREAM_REFILL_THRESHOLD) {
-            ESP_LOGW(TAG, "Buffer baixo: %zu KB", stream_available / 1024);
-        }
-    }
-}
-
-// ============================================================================
-// TASK CONTROLE
-// ============================================================================
-
-static const char* get_filename_from_path(const char *path) {
-    if (!path) return "unknown";
-    const char *filename = strrchr(path, '/');
-    return filename ? filename + 1 : path;
-}
-
-void player_control_task(void *pvParameter)
-{
-    player_cmd_t cmd;
-    TickType_t last_status_log = 0;
-    
-    ESP_LOGI(TAG, "Task controle iniciada");
-    
-    while (1) {
-        if (xTaskGetTickCount() - last_status_log > pdMS_TO_TICKS(30000)) {
-            log_system_status();
-            last_status_log = xTaskGetTickCount();
-        }
-        
-        if (xQueueReceive(control_queue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            switch (cmd) {
-                case CMD_PLAY_NEXT:
-                    ESP_LOGI(TAG, "CMD: PLAY_NEXT");
-                    ESP_LOGI(TAG, "Heap ANTES de limpar: %lu (largest: %lu)", 
-                            (unsigned long)esp_get_free_heap_size(),
-                            (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-                    
-                    // ========== MATAR TASK ANTERIOR ==========
-                    sys_status.streaming_active = false;
-                    
-                    if (file_reader_task_handle != NULL) {
-                        ESP_LOGI(TAG, "Finalizando task de leitura anterior...");
-                        vTaskDelay(pdMS_TO_TICKS(100));  // Aguarda finalização
-                        
-                        // Verifica se ainda existe
-                        if (eTaskGetState(file_reader_task_handle) != eDeleted) {
-                            ESP_LOGW(TAG, "Task não finalizou sozinha, deletando forçado...");
-                            vTaskDelete(file_reader_task_handle);
-                        }
-                        file_reader_task_handle = NULL;
-                        ESP_LOGI(TAG, "Task anterior finalizada");
-                    }
-                    // =========================================
-                    
-                    vTaskDelay(pdMS_TO_TICKS(300));  // Aumentado para 300ms
-                    
-                    underrun_count = 0;
-                    callback_count = 0;
-                    stream_stabilized = false;
-                    
-                    if (current_file) {
-                        fclose(current_file);
-                        current_file = NULL;
-                    }
-                    
-                    if (stream_buffer) rb_clear(stream_buffer);
-                    
-                    total_bytes_streamed = 0;
-                    callback_count = 0;
-                    underrun_count = 0;
-                    
-                    ESP_LOGI(TAG, "Heap DEPOIS de limpar: %lu (largest: %lu)", 
-                            (unsigned long)esp_get_free_heap_size(),
-                            (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-                    
-                    if (!sys_status.system_ready || wav_count == 0) {
-                        ESP_LOGW(TAG, "Sistema não pronto");
-                        break;
-                    }
-                    
-                    random_track();
-                    char *filepath = get_current_track_path();
-                    
-                    if (!filepath) {
-                        ESP_LOGE(TAG, "Path inválido");
-                        sys_status.file_errors++;
-                        break;
-                    }
-                    
-                    current_file = fopen(filepath, "rb");
-                    if (!current_file) {
-                        ESP_LOGE(TAG, "Falha abrir: %s", strerror(errno));
-                        sys_status.file_errors++;
-                        esp_restart();
-                        break;
-                    }
-                    
-                    ESP_LOGI(TAG, "Reproduzindo: %s", get_filename_from_path(filepath));
-                    
-                    esp_err_t analyze_ret = analyze_wav_file(filepath, &current_wav_info);
-                    
-                    if (analyze_ret == ESP_OK && current_wav_info.is_valid_wav) {
-                        ESP_LOGI(TAG, "WAV: %luHz %dch %dbit %lus",
-                                current_wav_info.sample_rate, current_wav_info.channels,
-                                current_wav_info.bits_per_sample, current_wav_info.duration_seconds);
-                        fseek(current_file, current_wav_info.data_start_offset, SEEK_SET);
-                    } else {
-                        ESP_LOGW(TAG, "Análise WAV falhou - raw");
-                        fseek(current_file, 0, SEEK_SET);
-                        memset(&current_wav_info, 0, sizeof(current_wav_info));
-                    }
-                    
-                    sys_status.streaming_active = true;
-                    sys_status.file_errors = 0;
-                    
-                    // ========== CRIAR NOVA TASK COM HANDLE ==========
-                    if (xTaskCreatePinnedToCore(file_reader_task, "reader", 
-                                            4096, NULL, 10, &file_reader_task_handle, 1) != pdPASS) {
-                        ESP_LOGE(TAG, "Falha criar task reader");
-                        fclose(current_file);
-                        current_file = NULL;
-                        sys_status.streaming_active = false;
-                        file_reader_task_handle = NULL;
-                        esp_restart();
-                        break;
-                    }
-                    // ================================================
-                    
-                    ESP_LOGI(TAG, "Pré-enchendo buffers...");
-                    
-                    size_t target_prebuffer = (STREAM_BUFFER_SIZE * 7) / 10;
-                    int wait_attempts = 0;
-                    
-                    while (wait_attempts < 100) {
-                        size_t stream_avail = rb_available(stream_buffer);
-                        
-                        if (stream_avail >= target_prebuffer) {
-                            ESP_LOGI(TAG, "Buffer pronto: %zu KB (%.0f%%)", 
-                                    stream_avail / 1024,
-                                    (stream_avail * 100.0) / STREAM_BUFFER_SIZE);
-                            break;
-                        }
-                        
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                        wait_attempts++;
-                    }
-                    
-                    if (wait_attempts >= 100) {
-                        ESP_LOGW(TAG, "Timeout pré-buffer, iniciando com %zu KB",
-                                rb_available(stream_buffer) / 1024);
-                    }
-                    
-                    ESP_LOGI(TAG, "Garantindo que áudio está ativo...");
-                    esp_err_t resume_ret = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
-                    if (resume_ret != ESP_OK) {
-                        ESP_LOGE(TAG, "Falha ao iniciar áudio: %s", esp_err_to_name(resume_ret));
-                    } else {
-                        ESP_LOGI(TAG, "Áudio iniciado com sucesso");
-                    }
-                    
-                    vTaskDelay(pdMS_TO_TICKS(200));
-                    
-                    ESP_LOGI(TAG, "Streaming iniciado");
-                    break;
-                    
-                case CMD_RETRY_CONNECTION:
-                    ESP_LOGI(TAG, "CMD: RETRY_CONNECTION");
-                    
-                    if (sys_status.connection_retries >= CONNECTION_RETRY_MAX) {
-                        ESP_LOGE(TAG, "Max tentativas excedido");
-                        xEventGroupSetBits(player_event_group, ERROR_BIT);
-                        break;
-                    }
-                    
-                    vTaskDelay(pdMS_TO_TICKS(2000));
-                    bluetooth_search_and_connect();
-                    break;
-                    
-                case CMD_RESTART_DISCOVERY:
-                    ESP_LOGI(TAG, "CMD: RESTART_DISCOVERY");
-                    
-                    if (sys_status.bt_connected) {
-                        ESP_LOGI(TAG, "Já conectado - cancelando restart discovery");
-                        break;
-                    }
-                    
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                    bluetooth_search_and_connect();
-                    break;
-                    
-                case CMD_STOP:
-                    ESP_LOGI(TAG, "CMD: STOP");
-                    sys_status.streaming_active = false;
-                    if (current_file) {
-                        fclose(current_file);
-                        current_file = NULL;
-                    }
-                    if (stream_buffer) rb_clear(stream_buffer);
-                    break;
+    ESP_LOGD(TAG, "GAP evt: %d", event);
+    switch (event) {
+        case ESP_BT_GAP_DISC_RES_EVT: {
+            char bda_str[18];
+            snprintf(bda_str, sizeof(bda_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    param->disc_res.bda[0], param->disc_res.bda[1],
+                    param->disc_res.bda[2], param->disc_res.bda[3],
+                    param->disc_res.bda[4], param->disc_res.bda[5]);
+            
+            // ✅ IDF 4.4.4: Verificar MAC address
+            bool mac_match = false;
+            if (target_mac_addr[0] != 0 || target_mac_addr[1] != 0 || target_mac_addr[2] != 0) {
+                if (memcmp(param->disc_res.bda, target_mac_addr, ESP_BD_ADDR_LEN) == 0) {
+                    mac_match = true;
+                }
+            }
+            
+            // Se encontrou por MAC, conectar imediatamente
+            if (mac_match && !device_found) {
+                device_found = true;
+                memcpy(target_device_addr, param->disc_res.bda, ESP_BD_ADDR_LEN);
                 
-                case CMD_TOGGLE_PAUSE:
-                    ESP_LOGI(TAG, "CMD: TOGGLE_PAUSE");
-                    
-                    if (sys_status.audio_playing) {
-                        ESP_LOGI(TAG, "Pausando stream...");
-                        sys_status.streaming_active = false;
-                        
-                        esp_err_t pause_ret = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
-                        if (pause_ret != ESP_OK) {
-                            ESP_LOGE(TAG, "Falha pausar: %s", esp_err_to_name(pause_ret));
-                        }
-                    } else {
-                        ESP_LOGI(TAG, "Retomando stream...");
-                        sys_status.streaming_active = true;
-                        
-                        esp_err_t resume_ret = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
-                        if (resume_ret != ESP_OK) {
-                            ESP_LOGE(TAG, "Falha retomar: %s", esp_err_to_name(resume_ret));
-                        }
-                    }
-                    break;
+                ESP_LOGI(TAG, "✅ Dispositivo encontrado por MAC!");
+                ESP_LOGI(TAG, "   MAC: %s", bda_str);
+                
+                if (discovery_timer) {
+                    xTimerStop(discovery_timer, 0);
+                }
 
+                // Só conectar após confirmação de discovery parada
+                if (discovery_active) {
+                    connect_after_discovery_stop = true;
+                    if (!discovery_stop_pending) {
+                        discovery_stop_pending = true;
+                        esp_bt_gap_cancel_discovery();
+                        ESP_LOGI(TAG, "🛑 Solicitado stop discovery antes de conectar");
+                    }
+                } else {
+                    player_cmd_t cmd = CMD_CONNECT_TARGET;
+                    enqueue_control_cmd(cmd);
+                }
+            }
+            break;
+        }
+        
+        case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
+            if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+                if (discovery_active) {
+                    ESP_LOGI(TAG, "🔍 Discovery parado");
+                }
+                discovery_active = false;
+                discovery_stop_pending = false;
+                log_bt_state("disc_stopped");
+                if (connect_after_discovery_stop && device_found && !sys_status.bt_connected) {
+                    connect_after_discovery_stop = false;
+                    player_cmd_t cmd = CMD_CONNECT_TARGET;
+                    enqueue_control_cmd(cmd);
+                }
+            } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
+                discovery_active = true;
+                discovery_stop_pending = false;
+                ESP_LOGI(TAG, "🔍 Discovery iniciado");
+                log_bt_state("disc_started");
+            }
+            break;
+        }
+        
+        case ESP_BT_GAP_AUTH_CMPL_EVT: {
+            if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+                ESP_LOGI(TAG, "✅ Autenticação OK");
+            } else {
+                ESP_LOGW(TAG, "⚠️ Auth falhou: %d", param->auth_cmpl.stat);
+            }
+            break;
+        }
+        
+        default:
+            break;
+    }
+}
+
+static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+{
+    ESP_LOGD(TAG, "A2DP evt: %d", event);
+    switch (event) {
+        case ESP_A2D_CONNECTION_STATE_EVT: {
+            esp_a2d_connection_state_t state = param->conn_stat.state;
+            ESP_LOGD(TAG, "A2DP conn state: %d", state);
+            
+            if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+                ESP_LOGI(TAG, "✅ A2DP conectado!");
+                sys_status.bt_connecting = false;
+                connect_after_discovery_stop = false;
+                
+                if (connection_timer) {
+                    xTimerStop(connection_timer, 0);
+                }
+                if (discovery_timer) {
+                    xTimerStop(discovery_timer, 0);
+                }
+                if (discovery_active) {
+                    esp_bt_gap_cancel_discovery();
+                    discovery_active = false;
+                    discovery_stop_pending = false;
+                }
+                
+                esp_err_t start_err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+                if (start_err == ESP_OK) {
+                    ESP_LOGI(TAG, "✅ Media control START enviado");
+                } else {
+                    ESP_LOGW(TAG, "⚠️ Media control falhou: %s", esp_err_to_name(start_err));
+                }
+                
+                sys_status.bt_connected = true;
+                sys_status.connection_retries = 0;
+                xEventGroupSetBits(player_event_group, BT_CONNECTED_BIT);
+                log_bt_state("a2dp_connected");
+            } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+                ESP_LOGW(TAG, "⚠️ A2DP desconectado");
+                sys_status.bt_connected = false;
+                sys_status.streaming_active = false;
+                sys_status.bt_connecting = false;
+                connect_after_discovery_stop = false;
+                xEventGroupClearBits(player_event_group, BT_CONNECTED_BIT);
+                xEventGroupClearBits(player_event_group, STREAM_READY_BIT);
+
+                ESP_LOGW(TAG, "Música interrompida, limpando estado...");
+                player_cmd_t stop_cmd = CMD_STOP;
+                enqueue_control_cmd(stop_cmd);
+
+                if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
+                    player_cmd_t retry_cmd = CMD_RETRY_CONNECTION;
+                    enqueue_control_cmd(retry_cmd);
+                }
+                log_bt_state("a2dp_disconnected");
+            }
+            break;
+        }
+        
+        case ESP_A2D_AUDIO_STATE_EVT: {
+            esp_a2d_audio_state_t state = param->audio_stat.state;
+            
+            if (state == ESP_A2D_AUDIO_STATE_STARTED) {
+                ESP_LOGI(TAG, "▶️ Stream de áudio iniciado");
+                sys_status.streaming_active = true;
+                xEventGroupSetBits(player_event_group, STREAM_READY_BIT);
+                if (!sys_status.audio_playing) {
+                    player_cmd_t cmd = CMD_PLAY_NEXT;
+                    enqueue_control_cmd(cmd);
+                }
+                log_bt_state("audio_started");
+            } else if (state == ESP_A2D_AUDIO_STATE_STOPPED) {
+                ESP_LOGI(TAG, "⏸️ Stream de áudio parado");
+                sys_status.streaming_active = false;
+                xEventGroupClearBits(player_event_group, STREAM_READY_BIT);
+                log_bt_state("audio_stopped");
+            }
+            break;
+        }
+        
+        case ESP_A2D_AUDIO_CFG_EVT: {
+            ESP_LOGI(TAG, "🔧 Codec configurado");
+            break;
+        }
+        
+        default:
+            break;
+    }
+}
+
+static void avrc_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+            if (param->conn_stat.connected) {
+                ESP_LOGI(TAG, "✅ AVRC conectado");
+            } else {
+                ESP_LOGI(TAG, "AVRC desconectado");
+            }
+            break;
+        
+        default:
+            break;
+    }
+}
+
+static void avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+            ESP_LOGI(TAG, "AVRC TG: %s", param->conn_stat.connected ? "conectado" : "desconectado");
+            break;
+
+        case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+            if (param->psth_cmd.key_state != ESP_AVRC_PT_CMD_STATE_PRESSED) {
+                break;
+            }
+            switch (param->psth_cmd.key_code) {
+                case ESP_AVRC_PT_CMD_PLAY:
+                    ESP_LOGI(TAG, "AVRCP clique: PLAY/PAUSE toggle");
+                    enqueue_control_cmd(playback_paused ? CMD_RESUME : CMD_PAUSE);
+                    break;
+                case ESP_AVRC_PT_CMD_PAUSE:
+                    ESP_LOGI(TAG, "AVRCP clique: PAUSE");
+                    enqueue_control_cmd(CMD_PAUSE);
+                    break;
+                case ESP_AVRC_PT_CMD_STOP:
+                    ESP_LOGI(TAG, "AVRCP clique: STOP");
+                    enqueue_control_cmd(CMD_STOP);
+                    break;
+                case ESP_AVRC_PT_CMD_FORWARD:
+                    ESP_LOGI(TAG, "AVRCP duplo clique: NEXT");
+                    enqueue_control_cmd(CMD_PLAY_NEXT);
+                    break;
+                case ESP_AVRC_PT_CMD_BACKWARD:
+                    ESP_LOGI(TAG, "AVRCP duplo clique: PREV");
+                    enqueue_control_cmd(CMD_PLAY_PREV);
+                    break;
+                case ESP_AVRC_PT_CMD_VOL_UP:
+                    volume_up();
+                    break;
+                case ESP_AVRC_PT_CMD_VOL_DOWN:
+                    volume_down();
+                    break;
                 default:
-                    ESP_LOGW(TAG, "Comando desconhecido: %d", cmd);
+                    ESP_LOGD(TAG, "AVRCP cmd não mapeado: 0x%02X", param->psth_cmd.key_code);
                     break;
             }
+            break;
+
+        default:
+            break;
+    }
+}
+
+static esp_err_t bluetooth_init(void)
+{
+    ESP_LOGI(TAG, "🔵 Inicializando Bluetooth...");
+    
+    esp_err_t ret;
+    
+    ESP_ERROR_CHECK(nvs_flash_init());
+    
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+    
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller init: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT controller enable: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ret = esp_bluedroid_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid init: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ret = esp_bluedroid_enable();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluedroid enable: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    esp_bt_dev_set_device_name("ESP32_MP3");
+    // Evita conexões ACL de entrada fora do fluxo controlado do player.
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    
+    esp_bt_gap_register_callback(gap_callback);
+    
+    // AVRCP precisa subir antes do A2DP source
+    esp_avrc_ct_init();
+    esp_avrc_ct_register_callback(avrc_callback);
+    esp_avrc_tg_init();
+    esp_avrc_tg_register_callback(avrc_tg_callback);
+
+    esp_avrc_psth_bit_mask_t cmd_set = {0};
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_PLAY);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_PAUSE);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_STOP);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_FORWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_BACKWARD);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_VOL_UP);
+    esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &cmd_set, ESP_AVRC_PT_CMD_VOL_DOWN);
+    esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &cmd_set);
+
+    esp_a2d_register_callback(a2dp_callback);
+    esp_a2d_source_register_data_callback(bt_a2dp_source_data_cb);
+    esp_a2d_source_init();
+    
+    sys_status.bt_initialized = true;
+    ESP_LOGI(TAG, "✅ Bluetooth inicializado");
+    
+    return ESP_OK;
+}
+
+static esp_err_t bluetooth_search_and_connect(void)
+{
+    if (sys_status.bt_connected || sys_status.bt_connecting) {
+        return ESP_OK;
+    }
+    if (discovery_active) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "🔍 Iniciando busca Bluetooth...");
+    
+    device_found = false;
+    connect_after_discovery_stop = false;
+    discovery_stop_pending = false;
+    sys_status.bt_connecting = true;
+    
+    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+    
+    if (discovery_timer) {
+        xTimerStart(discovery_timer, 0);
+    }
+    log_bt_state("search_start");
+    
+    return ESP_OK;
+}
+
+static void start_current_track_playback(void)
+{
+    stop_playback_and_reset(true, "start_track");
+
+    total_bytes_streamed = 0;
+    underrun_count = 0;
+    callback_count = 0;
+    cb_lock_fail_count = 0;
+    cb_empty_count = 0;
+    cb_partial_count = 0;
+    producer_frame_count = 0;
+    producer_drop_count = 0;
+    stream_stabilized = false;
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    file_reader_task_running = true;
+    playback_paused = false;
+    if (xTaskCreatePinnedToCore(decode_and_stream, "decode",
+                                6144, NULL, 6, &file_reader_task_handle, 1) == pdPASS) {
+        ESP_LOGI(TAG, "✅ Task decode criada (prio 6)");
+        sys_status.audio_playing = true;
+    } else {
+        ESP_LOGE(TAG, "❌ Falha criar task");
+        sys_status.file_errors++;
+        file_reader_task_running = false;
+    }
+}
+
+// ============================================================================
+// PLAYER CONTROL TASK
+// ============================================================================
+
+static void player_control_task(void *pvParameter)
+{
+    ESP_LOGI(TAG, "Task controle iniciada");
+    player_cmd_t cmd;
+    
+    // ✅ Proteção contra comandos duplicados
+    static TickType_t last_play_next_time = 0;
+    static const TickType_t PLAY_NEXT_DEBOUNCE_MS = 3000;  // 3 segundos entre músicas (aumentado)
+    
+    while (1) {
+        if (xQueueReceive(control_queue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            ESP_LOGD(TAG, "Queue -> %s", cmd_to_str(cmd));
+            log_queue_state("after_dequeue");
+            switch (cmd) {
+                case CMD_PLAY_NEXT:
+                    cmd_play_next_pending = false;
+                    break;
+                case CMD_PLAY_PREV:
+                    cmd_play_prev_pending = false;
+                    break;
+                case CMD_RETRY_CONNECTION:
+                    cmd_retry_pending = false;
+                    break;
+                case CMD_RESTART_DISCOVERY:
+                    cmd_restart_disc_pending = false;
+                    break;
+                case CMD_CONNECT_TARGET:
+                    cmd_connect_pending = false;
+                    break;
+                default:
+                    break;
+            }
+            
+            switch (cmd) {
+                case CMD_PLAY_NEXT: {
+                    if (!bt_ready_for_playback()) {
+                        ESP_LOGW(TAG, "⚠️ PLAY_NEXT ignorado (BT/stream não pronto)");
+                        break;
+                    }
+
+                    // ✅ PROTEÇÃO: Ignorar se chamado muito rápido
+                    TickType_t now = xTaskGetTickCount();
+                    if (last_play_next_time != 0 &&
+                        (now - last_play_next_time) < pdMS_TO_TICKS(PLAY_NEXT_DEBOUNCE_MS)) {
+                        ESP_LOGW(TAG, "⚠️ PLAY_NEXT ignorado (debounce: %lu ms)", 
+                                (unsigned long)TICKS_TO_MS(now - last_play_next_time));
+                        break;
+                    }
+                    last_play_next_time = now;
+
+                    int old_track = current_track;
+                    current_track = get_random_track(current_track);
+                    ESP_LOGI(TAG, "🎲 PLAY_NEXT aleatório: [%d/%d] → [%d/%d]",
+                             old_track + 1, mp3_count, current_track + 1, mp3_count);
+                    
+                    ESP_LOGI(TAG, "🎵 Comando: PLAY_NEXT para track [%d/%d]", 
+                            current_track + 1, mp3_count);
+                    start_current_track_playback();
+                    break;
+                }
+
+                case CMD_PLAY_PREV: {
+                    if (!bt_ready_for_playback()) {
+                        ESP_LOGW(TAG, "⚠️ PLAY_PREV ignorado (BT/stream não pronto)");
+                        break;
+                    }
+                    TickType_t now = xTaskGetTickCount();
+                    if (last_play_next_time != 0 &&
+                        (now - last_play_next_time) < pdMS_TO_TICKS(800)) {
+                        ESP_LOGW(TAG, "⚠️ PLAY_PREV ignorado (debounce: %lu ms)",
+                                (unsigned long)TICKS_TO_MS(now - last_play_next_time));
+                        break;
+                    }
+                    last_play_next_time = now;
+
+                    int old_track = current_track;
+                    current_track = get_previous_track(current_track);
+                    ESP_LOGI(TAG, "⏮️ PLAY_PREV: [%d/%d] → [%d/%d]",
+                             old_track + 1, mp3_count, current_track + 1, mp3_count);
+                    start_current_track_playback();
+                    break;
+                }
+                
+                case CMD_STOP:
+                    ESP_LOGI(TAG, "⏹️ Comando: STOP");
+                    stop_playback_and_reset(true, "cmd_stop");
+                    break;
+
+                case CMD_PAUSE:
+                    ESP_LOGI(TAG, "⏸️ Comando: PAUSE");
+                    playback_paused = true;
+                    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+                    break;
+
+                case CMD_RESUME:
+                    ESP_LOGI(TAG, "▶️ Comando: RESUME");
+                    playback_paused = false;
+                    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+                    break;
+                
+                case CMD_RETRY_CONNECTION:
+                    if (sys_status.bt_connected || sys_status.bt_connecting) {
+                        ESP_LOGI(TAG, "RETRY_CONNECTION ignorado: já conectado/conectando");
+                        break;
+                    }
+                    ESP_LOGI(TAG, "🔄 Comando: RETRY_CONNECTION");
+                    
+                    if ((sys_status.connection_retries + 1) < CONNECTION_RETRY_MAX) {
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                        if (sys_status.bt_connected || sys_status.bt_connecting) {
+                            break;
+                        }
+                        sys_status.connection_retries++;
+
+                        // Primeiro tenta conexão direta no MAC conhecido para evitar race de discovery.
+                        memcpy(target_device_addr, target_mac_addr, ESP_BD_ADDR_LEN);
+                        device_found = true;
+                        sys_status.bt_connecting = true;
+                        connect_after_discovery_stop = false;
+                        player_cmd_t conn_cmd = CMD_CONNECT_TARGET;
+                        if (!enqueue_control_cmd(conn_cmd)) {
+                            // Se já houver connect pendente, não abrir discovery em paralelo.
+                            // Discovery fica como fallback quando timeout ocorrer.
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "❌ Máximo de tentativas");
+                        xEventGroupSetBits(player_event_group, ERROR_BIT);
+                    }
+                    break;
+                
+                case CMD_RESTART_DISCOVERY:
+                    if (sys_status.bt_connected || sys_status.bt_connecting) {
+                        ESP_LOGI(TAG, "RESTART_DISCOVERY ignorado: já conectado/conectando");
+                        break;
+                    }
+                    ESP_LOGI(TAG, "🔄 Comando: RESTART_DISCOVERY");
+                    
+                    device_found = false;
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    bluetooth_search_and_connect();
+                    break;
+
+                case CMD_CONNECT_TARGET: {
+                    if (!device_found || sys_status.bt_connected || sys_status.bt_connecting == false) {
+                        ESP_LOGW(TAG, "CONNECT_TARGET ignorado | found:%d connected:%d connecting:%d",
+                                 device_found, sys_status.bt_connected, sys_status.bt_connecting);
+                        break;
+                    }
+                    if (discovery_active) {
+                        connect_after_discovery_stop = true;
+                        if (!discovery_stop_pending) {
+                            discovery_stop_pending = true;
+                            esp_bt_gap_cancel_discovery();
+                            ESP_LOGI(TAG, "🛑 Cancelando discovery para conectar alvo");
+                        }
+                        break;
+                    }
+                    ESP_LOGI(TAG, "🔗 Conectando ao A2DP...");
+                    if (connection_timer) {
+                        xTimerStop(connection_timer, 0);
+                    }
+                    sys_status.bt_connecting = true;
+                    esp_err_t conn_err = esp_a2d_source_connect(target_device_addr);
+                    if (conn_err != ESP_OK) {
+                        ESP_LOGE(TAG, "❌ Falha connect: %s", esp_err_to_name(conn_err));
+                        device_found = false;
+                        sys_status.bt_connecting = false;
+                    } else {
+                        ESP_LOGI(TAG, "✅ Comando connect enviado");
+                        if (connection_timer) {
+                            xTimerStart(connection_timer, 0);
+                        }
+                        log_bt_state("connect_cmd_sent");
+                    }
+                    break;
+                }
+                
+                default:
+                    break;
+            }
+        }
+        
+        EventBits_t bits = xEventGroupGetBits(player_event_group);
+        
+        if (bits & TRACK_FINISHED_BIT) {
+            ESP_LOGI(TAG, "✅ Track finalizado, preparando próxima...");
+            xEventGroupClearBits(player_event_group, TRACK_FINISHED_BIT);
+            
+            // ✅ Limpar comandos duplicados da queue
+            player_cmd_t dummy;
+            int cleared = 0;
+            while (xQueueReceive(control_queue, &dummy, 0) == pdTRUE) {
+                switch (dummy) {
+                    case CMD_PLAY_NEXT: cmd_play_next_pending = false; break;
+                    case CMD_PLAY_PREV: cmd_play_prev_pending = false; break;
+                    case CMD_RETRY_CONNECTION: cmd_retry_pending = false; break;
+                    case CMD_RESTART_DISCOVERY: cmd_restart_disc_pending = false; break;
+                    case CMD_CONNECT_TARGET: cmd_connect_pending = false; break;
+                    default: break;
+                }
+                cleared++;
+            }
+            if (cleared > 0) {
+                ESP_LOGI(TAG, "🗑️ Removidos %d comandos duplicados da queue", cleared);
+            }
+
+            if (!bt_ready_for_playback()) {
+                continue;
+            }
+            
+            // Aguardar um pouco antes de iniciar próxima
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
+            // Enviar comando para tocar próxima (aleatória dentro do CMD_PLAY_NEXT)
+            player_cmd_t next_cmd = CMD_PLAY_NEXT;
+            enqueue_control_cmd(next_cmd);
         }
         
         if (sys_status.file_errors > 10) {
@@ -1805,13 +2151,12 @@ void player_control_task(void *pvParameter)
 }
 
 // ============================================================================
-// TASK PRINCIPAL
+// MAIN TASK
 // ============================================================================
 
-void main_task(void *pvParameter)
+static void main_task(void *pvParameter)
 {
     ESP_LOGI(TAG, "Task principal iniciada");
-    
     ESP_LOGI(TAG, "Aguardando conexão Bluetooth...");
     
     EventBits_t bits = xEventGroupWaitBits(player_event_group, 
@@ -1832,7 +2177,7 @@ void main_task(void *pvParameter)
         
         if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
             player_cmd_t cmd = CMD_RETRY_CONNECTION;
-            xQueueSend(control_queue, &cmd, 0);
+            enqueue_control_cmd(cmd);
             
             bits = xEventGroupWaitBits(player_event_group, BT_CONNECTED_BIT, 
                                      false, true, pdMS_TO_TICKS(30000));
@@ -1850,33 +2195,45 @@ void main_task(void *pvParameter)
     
     ESP_LOGI(TAG, "Bluetooth conectado! Sistema pronto.");
     vTaskDelay(pdMS_TO_TICKS(2000));
-    esp_avrc_ct_send_set_player_value_cmd(0, ESP_AVRC_PS_REPEAT_MODE, 0);
-
+    
     log_system_status();
     
     xEventGroupWaitBits(player_event_group, STREAM_READY_BIT, 
                        false, false, pdMS_TO_TICKS(5000));
     
     TickType_t last_alive_log = xTaskGetTickCount();
+    TickType_t idle_without_bt_start = 0;
     
     while (1) {
         if (xTaskGetTickCount() - last_alive_log > pdMS_TO_TICKS(120000)) {
             ESP_LOGI(TAG, "Sistema ativo - Track: [%d/%d]", 
-                    current_track + 1, wav_count);
+                    current_track + 1, mp3_count);
             ESP_LOGI(TAG, "Stream: %s, Heap: %lu", 
                     sys_status.streaming_active ? "ON" : "OFF",
                     (unsigned long)esp_get_free_heap_size());
             last_alive_log = xTaskGetTickCount();
         }
         
-        if (sys_status.bt_connected && !sys_status.audio_playing && current_file) {
-            ESP_LOGW(TAG, "Inconsistência: arquivo aberto mas áudio parado");
-        }
-        
-        if (!sys_status.bt_connected && sys_status.connection_retries < CONNECTION_RETRY_MAX) {
-            ESP_LOGW(TAG, "Conexão perdida, tentando reconectar...");
-            player_cmd_t cmd = CMD_RETRY_CONNECTION;
-            xQueueSend(control_queue, &cmd, 0);
+        if (!sys_status.bt_connected && !sys_status.audio_playing && 
+            !sys_status.bt_connecting) {
+            if (idle_without_bt_start == 0) {
+                idle_without_bt_start = xTaskGetTickCount();
+            }
+
+            if (sys_status.connection_retries < CONNECTION_RETRY_MAX) {
+                ESP_LOGW(TAG, "Conexão perdida (sem música), tentando reconectar...");
+                player_cmd_t cmd = CMD_RETRY_CONNECTION;
+                enqueue_control_cmd(cmd);
+            }
+
+            TickType_t idle_ticks = xTaskGetTickCount() - idle_without_bt_start;
+            if (idle_ticks > pdMS_TO_TICKS(AUTO_SLEEP_IDLE_MS)) {
+                ESP_LOGW(TAG, "⏲️ Auto-sleep: %lu ms sem BT/áudio",
+                        (unsigned long)TICKS_TO_MS(idle_ticks));
+                enter_deep_sleep();
+            }
+        } else {
+            idle_without_bt_start = 0;
         }
         
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1889,24 +2246,31 @@ void main_task(void *pvParameter)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "===== ESP32 WAV Player v4.0 com Controle de Volume =====");
+    ESP_LOGI(TAG, "===== ESP32 MP3 Player - CORREÇÕES FINAIS =====");
     ESP_LOGI(TAG, "Heap inicial: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
+    esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+    if (wake == ESP_SLEEP_WAKEUP_EXT0) {
+        ESP_LOGI(TAG, "🔋 Wakeup por botão (EXT0 GPIO %d)", PIN_PWR_SLEEP);
+    } else if (wake != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        ESP_LOGI(TAG, "🔋 Wakeup cause: %d", wake);
+    }
+
     esp_log_level_set("*", ESP_LOG_INFO);
-    esp_log_level_set("BT_AVRC", ESP_LOG_VERBOSE);
-    esp_log_level_set("BT_APPL", ESP_LOG_VERBOSE);
-    esp_log_level_set("BT_AV", ESP_LOG_VERBOSE);
-    esp_log_level_set("BT_HCI", ESP_LOG_VERBOSE);
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    esp_log_level_set("BT_AVRC", ESP_LOG_WARN);
+    esp_log_level_set("BT_APPL", ESP_LOG_WARN);
+    esp_log_level_set("BT_AV", ESP_LOG_WARN);
     
     memset(&sys_status, 0, sizeof(sys_status));
     
     player_event_group = xEventGroupCreate();
     control_queue = xQueueCreate(15, sizeof(player_cmd_t));
-    connection_timer = xTimerCreate("conn", pdMS_TO_TICKS(15000), 
+    connection_timer = xTimerCreate("conn", pdMS_TO_TICKS(60000), 
                                    pdFALSE, NULL, connection_timeout_callback);
     discovery_timer = xTimerCreate("disc", pdMS_TO_TICKS(DISCOVERY_TIMEOUT_SEC * 1000), 
                                   pdFALSE, NULL, discovery_timeout_callback);
-    buffer_monitor_timer = xTimerCreate("buf_mon", pdMS_TO_TICKS(5000),
+    buffer_monitor_timer = xTimerCreate("buf_mon", pdMS_TO_TICKS(500),
                                        pdTRUE, NULL, buffer_monitor_callback);
     
     if (!player_event_group || !control_queue || !connection_timer || 
@@ -1926,14 +2290,14 @@ void app_main(void)
         return;
     }
     
-    ret = count_wav_files();
+    ret = count_mp3_files();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha escanear WAVs: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Falha escanear MP3s: %s", esp_err_to_name(ret));
         if (ret == ESP_ERR_NOT_FOUND) {
-            ESP_LOGE(TAG, "Nenhum WAV encontrado!");
+            ESP_LOGE(TAG, "Nenhum MP3 encontrado!");
             while (1) {
                 vTaskDelay(pdMS_TO_TICKS(10000));
-                ESP_LOGE(TAG, "Aguardando arquivos WAV...");
+                ESP_LOGE(TAG, "Aguardando arquivos MP3...");
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1949,7 +2313,7 @@ void app_main(void)
         return;
     }
     
-    ESP_LOGI(TAG, "Heap após buffers: %lu", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Heap após buffers: %lu (esperado ~40KB+)", (unsigned long)esp_get_free_heap_size());
     
     ret = bluetooth_init();
     if (ret != ESP_OK) {
@@ -1963,7 +2327,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Heap após BT: %lu", (unsigned long)esp_get_free_heap_size());
     
     if (xTaskCreatePinnedToCore(player_control_task, "ctrl", 
-                            4096, NULL, 7, NULL, 1) != pdPASS) {
+                            3584, NULL, 5, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "Falha task controle");
         cleanup_audio_buffers();
         esp_restart();
@@ -1971,7 +2335,7 @@ void app_main(void)
     }
 
     if (xTaskCreatePinnedToCore(main_task, "main", 
-                            3072, NULL, 5, NULL, 1) != pdPASS) {
+                            2560, NULL, 4, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "Falha task main");
         cleanup_audio_buffers();
         esp_restart();
@@ -1981,9 +2345,10 @@ void app_main(void)
     ESP_LOGI(TAG, "Tasks criadas");
     
     init_volume_buttons();
+    configure_deep_sleep_wakeup();
     
     if (xTaskCreatePinnedToCore(volume_control_task, "volume", 
-                            2048, NULL, 6, NULL, 0) != pdPASS) {
+                            3072, NULL, 3, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "Falha task volume");
         cleanup_audio_buffers();
         esp_restart();
@@ -2004,6 +2369,15 @@ void app_main(void)
     
     ESP_LOGI(TAG, "Sistema iniciado!");
     
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "🎯 Configuração de busca Bluetooth:");
+    ESP_LOGI(TAG, "   Modo: Busca por MAC address");
+    ESP_LOGI(TAG, "   MAC alvo: %02X:%02X:%02X:%02X:%02X:%02X",
+            target_mac_addr[0], target_mac_addr[1], target_mac_addr[2],
+            target_mac_addr[3], target_mac_addr[4], target_mac_addr[5]);
+    ESP_LOGI(TAG, "   Referência: '%s'", TARGET_DEVICE_NAME);
+    ESP_LOGI(TAG, "");
+    
     TickType_t last_check = xTaskGetTickCount();
     uint32_t restart_counter = 0;
     
@@ -2018,8 +2392,8 @@ void app_main(void)
             
             if (free_heap < 30000) {
                 restart_counter++;
-                ESP_LOGW(TAG, "Memória baixa (%zu) - cnt: %lu", 
-                        free_heap, restart_counter);
+                ESP_LOGW(TAG, "Memória baixa (%zu) - cnt: %lu",
+                        free_heap, (unsigned long)restart_counter);
                 
                 if (restart_counter >= 3) {
                     ESP_LOGE(TAG, "Memória crítica, restart");

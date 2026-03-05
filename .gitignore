@@ -1,0 +1,58 @@
+# ESP-IDF build artifacts
+/build/
+/sdkconfig.old
+/sdkconfig.ci
+/sdkconfig.cmake
+/flasher_args.json
+/project_description.json
+/compile_commands.json
+
+# Firmware outputs
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+
+# CMake / Ninja
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Logs / dumps
+*.log
+*.dmp
+core
+core.*
+
+# Python / virtualenv
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE / editor local files
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Backups / temp
+*.bak
+*.tmp
+*.orig
+*~
+
+# User-specific ESP-IDF local config
+/esp_idf_project_configuration.json
