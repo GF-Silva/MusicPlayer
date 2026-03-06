@@ -42,18 +42,24 @@ bool media_drop_trailing_tag_if_present(uint8_t **ptr, int *bytes_left, const ch
         return false;
     }
 
-    if (*bytes_left >= 128 && memcmp(*ptr, "TAG", 3) == 0) {
-        ESP_LOGI(tag, "Fim: ID3v1 tail detectado (%d bytes restantes)", *bytes_left);
-        *ptr += *bytes_left;
-        *bytes_left = 0;
-        return true;
+    /* EOF tail can contain ID3v1/APE tag possibly preceded by a few junk bytes.
+     * Scan a small window and, if found, discard remaining tail. */
+    for (int i = 0; i + 3 <= *bytes_left && i < 256; i++) {
+        if ((*bytes_left - i) >= 128 && memcmp(*ptr + i, "TAG", 3) == 0) {
+            ESP_LOGI(tag, "Fim: ID3v1 tail detectado (offset=%d, rem=%d)", i, *bytes_left);
+            *ptr += *bytes_left;
+            *bytes_left = 0;
+            return true;
+        }
     }
 
-    if (*bytes_left >= 32 && memcmp(*ptr, "APETAGEX", 8) == 0) {
-        ESP_LOGI(tag, "Fim: APE tag detectado (%d bytes restantes)", *bytes_left);
-        *ptr += *bytes_left;
-        *bytes_left = 0;
-        return true;
+    for (int i = 0; i + 8 <= *bytes_left && i < 256; i++) {
+        if ((*bytes_left - i) >= 32 && memcmp(*ptr + i, "APETAGEX", 8) == 0) {
+            ESP_LOGI(tag, "Fim: APE tail detectado (offset=%d, rem=%d)", i, *bytes_left);
+            *ptr += *bytes_left;
+            *bytes_left = 0;
+            return true;
+        }
     }
 
     return false;

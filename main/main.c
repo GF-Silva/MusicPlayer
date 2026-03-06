@@ -224,15 +224,22 @@ void app_main(void)
     ESP_LOGI(TAG, "===== ESP32 MP3 Player - CORREÇÕES FINAIS =====");
     ESP_LOGI(TAG, "Heap inicial: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
-    // LED azul (GPIO2) como indicador principal de "ligado".
-    pm_set_power_led((gpio_num_t)BOARD_LED_GPIO, BOARD_LED_ACTIVE_HIGH, true);
-
     esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     if (wake == ESP_SLEEP_WAKEUP_EXT0) {
         ESP_LOGI(TAG, "🔋 Wakeup por botão (EXT0 GPIO %d)", PIN_PWR_SLEEP);
+        if (!pm_require_hold_low((gpio_num_t)PIN_PWR_SLEEP, POWER_HOLD_MS, 20, TAG)) {
+            ESP_LOGI(TAG, "Wake curto: retornando para deep sleep");
+            pm_hold_led_off_during_sleep((gpio_num_t)BOARD_LED_GPIO, BOARD_LED_ACTIVE_HIGH);
+            pm_configure_ext0_wakeup((gpio_num_t)PIN_PWR_SLEEP, 0, TAG);
+            vTaskDelay(pdMS_TO_TICKS(40));
+            esp_deep_sleep_start();
+        }
     } else if (wake != ESP_SLEEP_WAKEUP_UNDEFINED) {
         ESP_LOGI(TAG, "🔋 Wakeup cause: %d", wake);
     }
+
+    // LED azul (GPIO2) como indicador principal de "ligado".
+    pm_set_power_led((gpio_num_t)BOARD_LED_GPIO, BOARD_LED_ACTIVE_HIGH, true);
 
     app_log_apply_levels(TAG);
 

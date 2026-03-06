@@ -71,3 +71,35 @@ bool pm_wait_pin_inactive(gpio_num_t wake_pin, uint32_t timeout_ms, const char *
     vTaskDelay(pdMS_TO_TICKS(80));
     return true;
 }
+
+bool pm_require_hold_low(gpio_num_t wake_pin,
+                         uint32_t hold_ms,
+                         uint32_t sample_ms,
+                         const char *tag)
+{
+    if (sample_ms == 0) {
+        sample_ms = 20;
+    }
+
+    gpio_reset_pin(wake_pin);
+    gpio_set_direction(wake_pin, GPIO_MODE_INPUT);
+    gpio_pullup_en(wake_pin);
+    gpio_pulldown_dis(wake_pin);
+
+    if (gpio_get_level(wake_pin) != 0) {
+        ESP_LOGI(tag, "Wake sem hold (botao nao pressionado no inicio)");
+        return false;
+    }
+
+    TickType_t start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(hold_ms)) {
+        if (gpio_get_level(wake_pin) != 0) {
+            ESP_LOGI(tag, "Wake cancelado: hold menor que %lu ms", (unsigned long)hold_ms);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(sample_ms));
+    }
+
+    ESP_LOGI(tag, "Wake confirmado por hold de %lu ms", (unsigned long)hold_ms);
+    return true;
+}

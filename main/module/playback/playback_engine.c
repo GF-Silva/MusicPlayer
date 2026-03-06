@@ -86,6 +86,7 @@ void playback_engine_decode_task(void *pvParameter)
     *s_ctx->last_producer_tick = xTaskGetTickCount();
     uint16_t eof_no_sync_loops = 0;
     uint16_t eof_decode_err_loops = 0;
+    uint16_t eof_underflow_loops = 0;
 
     while (frame_count < s_ctx->prebuffer_frames && *s_ctx->file_reader_task_running) {
         if (!*s_ctx->bt_connected) {
@@ -255,6 +256,29 @@ void playback_engine_decode_task(void *pvParameter)
                             0);
 
         if (err != ERR_MP3_NONE) {
+            if ((err == ERR_MP3_INDATA_UNDERFLOW || err == ERR_MP3_MAINDATA_UNDERFLOW) &&
+                feof(*s_ctx->current_file)) {
+                eof_underflow_loops++;
+                if (s_ctx->media_drop_trailing_tag_if_present(s_ctx->read_ptr,
+                                                              s_ctx->bytes_left_in_mp3,
+                                                              s_ctx->tag)) {
+                    reached_eof = true;
+                    break;
+                }
+                if (*s_ctx->bytes_left_in_mp3 < 4 || eof_underflow_loops > 8) {
+                    ESP_LOGI(s_ctx->tag,
+                             "🏁 Fim do stream (underflow+EOF, loops=%u, bytes=%d)",
+                             (unsigned)eof_underflow_loops,
+                             *s_ctx->bytes_left_in_mp3);
+                    reached_eof = true;
+                    break;
+                }
+                vTaskDelay(1);
+                continue;
+            } else {
+                eof_underflow_loops = 0;
+            }
+
             if (feof(*s_ctx->current_file)) {
                 eof_decode_err_loops++;
                 if (s_ctx->media_drop_trailing_tag_if_present(s_ctx->read_ptr,
@@ -280,6 +304,7 @@ void playback_engine_decode_task(void *pvParameter)
             continue;
         }
         eof_decode_err_loops = 0;
+        eof_underflow_loops = 0;
 
         MP3FrameInfo fi;
         MP3GetLastFrameInfo(*s_ctx->mp3_decoder, &fi);
