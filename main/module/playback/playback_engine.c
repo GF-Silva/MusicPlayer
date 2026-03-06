@@ -3,7 +3,6 @@
 #include <string.h>
 
 #include "app_log.h"
-#include "control_queue.h"
 #include "esp_log.h"
 
 static playback_engine_ctx_t *s_ctx;
@@ -46,6 +45,7 @@ void playback_engine_decode_task(void *pvParameter)
 
     char filepath[s_ctx->max_path_len];
     bool reached_eof = false;
+    const char *exit_reason = "loop_exit";
 
     if (s_ctx->media_get_mp3_path(s_ctx->mount_point, *s_ctx->current_track, filepath, sizeof(filepath)) != ESP_OK) {
         goto task_fail;
@@ -90,10 +90,11 @@ void playback_engine_decode_task(void *pvParameter)
 
     while (frame_count < s_ctx->prebuffer_frames && *s_ctx->file_reader_task_running) {
         if (!*s_ctx->bt_connected) {
+            exit_reason = "bt_disconnected_prebuffer";
             break;
         }
 
-        if (*s_ctx->bytes_left_in_mp3 < s_ctx->mp3_critical_bytes) {
+        if (*s_ctx->bytes_left_in_mp3 <= s_ctx->mp3_critical_bytes) {
             if (*s_ctx->bytes_left_in_mp3 > 0 && *s_ctx->read_ptr != *s_ctx->mp3_input_buffer) {
                 memmove(*s_ctx->mp3_input_buffer, *s_ctx->read_ptr, (size_t)*s_ctx->bytes_left_in_mp3);
             }
@@ -106,6 +107,7 @@ void playback_engine_decode_task(void *pvParameter)
                 *s_ctx->bytes_left_in_mp3 += (int)r;
             } else if (feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 == 0) {
                 reached_eof = true;
+                exit_reason = "eof_prebuffer_empty";
                 break;
             }
         }
@@ -114,6 +116,7 @@ void playback_engine_decode_task(void *pvParameter)
         if (offset < 0) {
             if (feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 == 0) {
                 reached_eof = true;
+                exit_reason = "eof_prebuffer_no_sync";
                 break;
             }
             vTaskDelay(1);
@@ -158,6 +161,7 @@ void playback_engine_decode_task(void *pvParameter)
             continue;
         }
         if (!*s_ctx->bt_connected) {
+            exit_reason = "bt_disconnected_main";
             break;
         }
         if (!*s_ctx->streaming_active && (frame_count % 120 == 0)) {
@@ -170,7 +174,7 @@ void playback_engine_decode_task(void *pvParameter)
         size_t stream_available = ring_buffer_available(*s_ctx->stream_buffer);
         uint32_t stream_fill_percent = (uint32_t)((stream_available * 100U) / (size_t)s_ctx->stream_buffer_size);
 
-        if (*s_ctx->bytes_left_in_mp3 < s_ctx->mp3_critical_bytes) {
+        if (*s_ctx->bytes_left_in_mp3 <= s_ctx->mp3_critical_bytes) {
             if (*s_ctx->bytes_left_in_mp3 > 0 && *s_ctx->read_ptr != *s_ctx->mp3_input_buffer) {
                 memmove(*s_ctx->mp3_input_buffer, *s_ctx->read_ptr, (size_t)*s_ctx->bytes_left_in_mp3);
             }
@@ -202,6 +206,7 @@ void playback_engine_decode_task(void *pvParameter)
             } else if (feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 == 0) {
                 ESP_LOGI(s_ctx->tag, "🏁 Fim do arquivo MP3");
                 reached_eof = true;
+                exit_reason = "eof_main_empty";
                 break;
             }
         }
@@ -211,6 +216,7 @@ void playback_engine_decode_task(void *pvParameter)
             if (feof(*s_ctx->current_file) &&
                 s_ctx->media_drop_trailing_tag_if_present(s_ctx->read_ptr, s_ctx->bytes_left_in_mp3, s_ctx->tag)) {
                 reached_eof = true;
+                exit_reason = "eof_main_trailing_tag";
                 break;
             }
 
@@ -220,10 +226,20 @@ void playback_engine_decode_task(void *pvParameter)
                 eof_no_sync_loops = 0;
             }
 
-            if (!feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 > s_ctx->mp3_critical_bytes) {
+            if (!feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 >= s_ctx->mp3_critical_bytes) {
                 int drop = *s_ctx->bytes_left_in_mp3 - s_ctx->mp3_critical_bytes;
+                if (drop <= 0) {
+                    /* Evita lock em bytes_left == mp3_critical_bytes quando não há sync. */
+                    drop = s_ctx->mp3_no_sync_drop_bytes / 4;
+                    if (drop < 64) {
+                        drop = 64;
+                    }
+                }
                 if (drop > s_ctx->mp3_no_sync_drop_bytes) {
                     drop = s_ctx->mp3_no_sync_drop_bytes;
+                }
+                if (drop > *s_ctx->bytes_left_in_mp3) {
+                    drop = *s_ctx->bytes_left_in_mp3;
                 }
                 if (drop > 0) {
                     *s_ctx->read_ptr += drop;
@@ -239,6 +255,7 @@ void playback_engine_decode_task(void *pvParameter)
                          (unsigned)eof_no_sync_loops,
                          *s_ctx->bytes_left_in_mp3);
                 reached_eof = true;
+                exit_reason = "eof_main_no_sync";
                 break;
             }
             vTaskDelay(1);
@@ -263,6 +280,7 @@ void playback_engine_decode_task(void *pvParameter)
                                                               s_ctx->bytes_left_in_mp3,
                                                               s_ctx->tag)) {
                     reached_eof = true;
+                    exit_reason = "eof_main_underflow_tag";
                     break;
                 }
                 if (*s_ctx->bytes_left_in_mp3 < 4 || eof_underflow_loops > 8) {
@@ -271,6 +289,7 @@ void playback_engine_decode_task(void *pvParameter)
                              (unsigned)eof_underflow_loops,
                              *s_ctx->bytes_left_in_mp3);
                     reached_eof = true;
+                    exit_reason = "eof_main_underflow";
                     break;
                 }
                 vTaskDelay(1);
@@ -285,6 +304,7 @@ void playback_engine_decode_task(void *pvParameter)
                                                               s_ctx->bytes_left_in_mp3,
                                                               s_ctx->tag)) {
                     reached_eof = true;
+                    exit_reason = "eof_main_decodeerr_tag";
                     break;
                 }
             } else {
@@ -298,6 +318,7 @@ void playback_engine_decode_task(void *pvParameter)
                          (unsigned)eof_decode_err_loops,
                          *s_ctx->bytes_left_in_mp3);
                 reached_eof = true;
+                exit_reason = "eof_main_decodeerr";
                 break;
             }
             vTaskDelay(1);
@@ -391,11 +412,32 @@ void playback_engine_decode_task(void *pvParameter)
         } else if (current_fill > 50U) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
+
+        /* Defensive EOF close-out: if EOF was already hit by fread and decode
+         * drained all pending bytes, finalize immediately. */
+        if (feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 == 0) {
+            reached_eof = true;
+            exit_reason = "eof_main_drained";
+            break;
+        }
     }
 
 task_fail:
-    ESP_LOGI(s_ctx->tag, "⏹ Decoder encerrado");
+    bool file_at_eof = (*s_ctx->current_file != NULL) ? feof(*s_ctx->current_file) : false;
+    ESP_LOGI(s_ctx->tag,
+             "⏹ Decoder encerrado | reason=%s eof=%d file_eof=%d bytes_left=%d bt=%d running=%d",
+             exit_reason,
+             reached_eof,
+             file_at_eof,
+             *s_ctx->bytes_left_in_mp3,
+             *s_ctx->bt_connected,
+             *s_ctx->file_reader_task_running);
     bool natural_finish = reached_eof;
+
+    if (!natural_finish && file_at_eof && *s_ctx->bytes_left_in_mp3 == 0 && *s_ctx->bt_connected) {
+        ESP_LOGW(s_ctx->tag, "EOF confirmado no encerramento; promovendo para fim natural");
+        natural_finish = true;
+    }
 
     if (*s_ctx->current_file) {
         fclose(*s_ctx->current_file);
@@ -413,7 +455,6 @@ task_fail:
 
     if (natural_finish && *s_ctx->bt_connected) {
         xEventGroupSetBits(*s_ctx->player_event_group, s_ctx->track_finished_bit);
-        control_enqueue(CMD_PLAY_NEXT, s_ctx->tag);
     }
 
     vTaskDelete(NULL);

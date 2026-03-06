@@ -35,6 +35,7 @@ typedef struct {
     uint32_t bt_connecting_stuck_ms;
     uint32_t auto_sleep_idle_ms;
     uint32_t a2dp_open_fail_rediscovery_threshold;
+    uint32_t decode_stall_recovery_ms;
 
     int control_queue_len;
 

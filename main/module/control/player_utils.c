@@ -4,7 +4,8 @@
 
 bool player_bt_ready_for_playback(bool bt_connected, bool streaming_active)
 {
-    return bt_connected && streaming_active;
+    (void)streaming_active;
+    return bt_connected;
 }
 
 void player_set_bt_connecting(bool *bt_connecting,

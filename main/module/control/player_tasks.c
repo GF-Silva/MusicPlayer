@@ -27,6 +27,7 @@ static bool ready(void)
            s_ctx->device_found && s_ctx->connect_after_discovery_stop &&
            s_ctx->current_track && s_ctx->mp3_count && s_ctx->connection_retries && s_ctx->file_errors &&
            s_ctx->a2dp_open_fail_streak && s_ctx->bt_connecting_since &&
+           s_ctx->last_producer_tick &&
            s_ctx->target_device_addr && s_ctx->target_mac_addr && s_ctx->connection_timer &&
            s_ctx->bt_ready_for_playback && s_ctx->get_random_track && s_ctx->get_previous_track &&
            s_ctx->start_current_track_playback && s_ctx->stop_playback_and_reset &&
@@ -47,6 +48,7 @@ void player_tasks_control_task(void *pvParameter)
     player_cmd_t cmd;
     TickType_t last_play_next_time = 0;
     const TickType_t play_next_debounce_ms = 3000;
+    bool play_next_from_track_finish_pending = false;
 
     while (1) {
         if (control_dequeue(&cmd, pdMS_TO_TICKS(1000))) {
@@ -72,11 +74,16 @@ void player_tasks_control_task(void *pvParameter)
                 case CMD_PLAY_NEXT: {
                     if (!s_ctx->bt_ready_for_playback(*s_ctx->bt_connected, *s_ctx->streaming_active)) {
                         ESP_LOGW(s_ctx->tag, "⚠️ PLAY_NEXT ignorado (BT/stream não pronto)");
+                        play_next_from_track_finish_pending = false;
                         break;
                     }
 
                     TickType_t now = xTaskGetTickCount();
-                    if (last_play_next_time != 0 &&
+                    bool bypass_debounce = play_next_from_track_finish_pending;
+                    play_next_from_track_finish_pending = false;
+
+                    if (!bypass_debounce &&
+                        last_play_next_time != 0 &&
                         (now - last_play_next_time) < pdMS_TO_TICKS(play_next_debounce_ms)) {
                         ESP_LOGW(s_ctx->tag,
                                  "⚠️ PLAY_NEXT ignorado (debounce: %lu ms)",
@@ -271,7 +278,11 @@ void player_tasks_control_task(void *pvParameter)
             }
 
             vTaskDelay(pdMS_TO_TICKS(1000));
-            control_enqueue(CMD_PLAY_NEXT, s_ctx->tag);
+            if (control_enqueue(CMD_PLAY_NEXT, s_ctx->tag)) {
+                play_next_from_track_finish_pending = true;
+            } else {
+                ESP_LOGW(s_ctx->tag, "⚠️ Falha ao enfileirar PLAY_NEXT após fim da track");
+            }
         }
 
         if (*s_ctx->file_errors > 10) {
@@ -317,8 +328,11 @@ void player_tasks_main_task(void *pvParameter)
     TickType_t last_alive_log = xTaskGetTickCount();
     TickType_t idle_without_bt_start = 0;
     TickType_t last_reconnect_log = 0;
+    TickType_t last_decode_stall_recovery = 0;
 
     while (1) {
+        TickType_t now = xTaskGetTickCount();
+
         if (xTaskGetTickCount() - last_alive_log > pdMS_TO_TICKS(120000)) {
             PERF_LOGI(s_ctx->tag,
                       "Sistema ativo - Track: [%d/%d]",
@@ -329,6 +343,30 @@ void player_tasks_main_task(void *pvParameter)
                       *s_ctx->streaming_active ? "ON" : "OFF",
                       (unsigned long)esp_get_free_heap_size());
             last_alive_log = xTaskGetTickCount();
+        }
+
+        if (s_ctx->decode_stall_recovery_ms > 0 &&
+            *s_ctx->bt_connected &&
+            *s_ctx->audio_playing &&
+            *s_ctx->streaming_active &&
+            !*s_ctx->playback_paused &&
+            *s_ctx->last_producer_tick != 0) {
+            TickType_t stalled_ticks = now - *s_ctx->last_producer_tick;
+            if (stalled_ticks > pdMS_TO_TICKS(s_ctx->decode_stall_recovery_ms)) {
+                if ((now - last_decode_stall_recovery) > pdMS_TO_TICKS(3000)) {
+                    ESP_LOGE(s_ctx->tag,
+                             "⚠️ Decode stall detectado (%lu ms sem produzir PCM). Forçando PLAY_NEXT",
+                             (unsigned long)TICKS_TO_MS_LOCAL(stalled_ticks));
+                    last_decode_stall_recovery = now;
+                }
+
+                if (!control_is_pending(CMD_PLAY_NEXT)) {
+                    control_enqueue(CMD_PLAY_NEXT, s_ctx->tag);
+                }
+
+                /* Evita loop de recovery imediato enquanto CMD_PLAY_NEXT é processado. */
+                *s_ctx->last_producer_tick = now;
+            }
         }
 
         if (!*s_ctx->bt_connected && !*s_ctx->audio_playing) {

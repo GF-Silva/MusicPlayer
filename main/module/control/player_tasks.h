@@ -38,6 +38,7 @@ typedef struct {
     uint32_t *a2dp_open_fail_streak;
 
     TickType_t *bt_connecting_since;
+    TickType_t *last_producer_tick;
 
     esp_bd_addr_t *target_device_addr;
     const esp_bd_addr_t *target_mac_addr;
@@ -47,6 +48,7 @@ typedef struct {
     uint32_t bt_connecting_stuck_ms;
     uint32_t auto_sleep_idle_ms;
     uint32_t a2dp_fail_rediscovery_threshold;
+    uint32_t decode_stall_recovery_ms;
 
     bool (*bt_ready_for_playback)(bool bt_connected, bool streaming_active);
     int (*get_random_track)(int current_track, int total_tracks);

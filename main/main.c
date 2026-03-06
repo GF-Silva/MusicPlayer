@@ -95,6 +95,7 @@
 #define POWER_HOLD_MS 2000
 #define AUTO_SLEEP_IDLE_MS (1 * 60 * 1000)  // 1 min sem BT/áudio -> deep sleep
 #define BT_CONNECTING_STUCK_MS (90 * 1000)  // destrava estado "conectando" preso
+#define DECODE_STALL_RECOVERY_MS (15 * 1000) // sem produzir PCM por muito tempo -> avançar faixa
 #define A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD 3
 #define PWR_RELEASE_WAIT_MS 5000
 
@@ -254,6 +255,7 @@ void app_main(void)
         .bt_connecting_stuck_ms = BT_CONNECTING_STUCK_MS,
         .auto_sleep_idle_ms = AUTO_SLEEP_IDLE_MS,
         .a2dp_open_fail_rediscovery_threshold = A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD,
+        .decode_stall_recovery_ms = DECODE_STALL_RECOVERY_MS,
         .control_queue_len = 15,
         .sd_mounted = &sys_status.sd_mounted,
         .bt_initialized = &sys_status.bt_initialized,
