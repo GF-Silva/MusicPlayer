@@ -1,6 +1,33 @@
 idf_component_register(
-    SRCS "main.c"
-    INCLUDE_DIRS "."
+    SRCS
+        "main.c"
+        "module/audio/ring_buffer.c"
+        "module/audio/audio_pipeline.c"
+        "module/audio/a2dp_stream.c"
+        "module/bt/bt_manager.c"
+        "module/bt/bt_callbacks.c"
+        "module/bootstrap/app_facade.c"
+        "module/bootstrap/app_bootstrap.c"
+        "module/control/control_queue.c"
+        "module/control/player_tasks.c"
+        "module/control/player_utils.c"
+        "module/input/input_manager.c"
+        "module/playback/media_library.c"
+        "module/playback/playback_engine.c"
+        "module/power/power_manager.c"
+        "module/power/sleep_manager.c"
+        "module/storage/sdcard_manager.c"
+    INCLUDE_DIRS
+        "."
+        "module/audio"
+        "module/bt"
+        "module/bootstrap"
+        "module/common"
+        "module/control"
+        "module/input"
+        "module/playback"
+        "module/power"
+        "module/storage"
     REQUIRES 
         bt
         esp_wifi
