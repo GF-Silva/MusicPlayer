@@ -1,31 +1,3 @@
-/*
- * ============================================================================
- * ESP32 MP3 Player - CORREÇÕES FINAIS
- * ============================================================================
- * 
- * CORREÇÕES APLICADAS:
- * 
- * 1. CONTROLE DE BUFFER MELHORADO:
- *    - Thresholds ajustados: 40-75% (era 30-70%)
- *    - Yield mais agressivo (a cada 3 frames vs 8)
- *    - Leitura adaptativa mais equilibrada
- * 
- * 2. TRANSIÇÃO ENTRE MÚSICAS:
- *    - Reset completo do stream buffer
- *    - Aguardar término da task anterior
- *    - Fechar arquivo antes de limpar decoder
- *    - Zerar bytes_left_in_mp3 e read_ptr
- * 
- * 3. FIM DE ARQUIVO:
- *    - Detectar EOF adequadamente
- *    - Processar bytes restantes no buffer
- *    - Limpar recursos na ordem correta
- * 
- * Compatível com: IDF 4.4.4 + libhelix
- * Data: 02/02/2026
- * ============================================================================
- */
-
 #include <string.h>
 #include <stdio.h>
 #include <dirent.h>
@@ -86,9 +58,6 @@
 #define BOARD_LED_GPIO 2
 #define BOARD_LED_ACTIVE_HIGH 1
 
-// Pinos de controle de volume
-#define PIN_VOL_UP   21
-#define PIN_VOL_DOWN 22
 #define PIN_PWR_SLEEP 33  // RTC IO: wakeup de deep sleep (botão ativo em LOW)
 #define DEBOUNCE_TIME_MS 50
 #define VOLUME_STEP 5
@@ -409,15 +378,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Tasks criadas");
 
     input_manager_cfg_t input_cfg = {
-        .pin_vol_up = PIN_VOL_UP,
-        .pin_vol_down = PIN_VOL_DOWN,
         .pin_power = PIN_PWR_SLEEP,
+        .led_gpio = BOARD_LED_GPIO,
+        .led_active_high = BOARD_LED_ACTIVE_HIGH,
         .debounce_ms = DEBOUNCE_TIME_MS,
         .click_timeout_ms = 500,
         .double_click_interval_ms = DOUBLE_CLICK_INTERVAL_MS,
         .long_click_threshold_ms = LONG_CLICK_THRESHOLD_MS,
         .power_hold_ms = POWER_HOLD_MS,
-        .next_track_guard_ms = 3000,
         .volume_step = VOLUME_STEP,
         .volume_percent = &current_volume,
         .volume_scale = &volume_scale,

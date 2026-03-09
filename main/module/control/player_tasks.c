@@ -264,6 +264,11 @@ void player_tasks_control_task(void *pvParameter)
         EventBits_t bits = xEventGroupGetBits(*s_ctx->player_event_group);
 
         if (bits & s_ctx->track_finished_bit) {
+            if (!s_ctx->bt_ready_for_playback(*s_ctx->bt_connected, *s_ctx->streaming_active)) {
+                ESP_LOGW(s_ctx->tag, "Track finalizada, aguardando BT pronto para avançar");
+                continue;
+            }
+
             ESP_LOGI(s_ctx->tag, "✅ Track finalizado, preparando próxima...");
             xEventGroupClearBits(*s_ctx->player_event_group, s_ctx->track_finished_bit);
 
@@ -271,10 +276,6 @@ void player_tasks_control_task(void *pvParameter)
             control_flush();
             if (cleared > 0) {
                 ESP_LOGI(s_ctx->tag, "🗑️ Removidos %d comandos duplicados da queue", cleared);
-            }
-
-            if (!s_ctx->bt_ready_for_playback(*s_ctx->bt_connected, *s_ctx->streaming_active)) {
-                continue;
             }
 
             vTaskDelay(pdMS_TO_TICKS(1000));

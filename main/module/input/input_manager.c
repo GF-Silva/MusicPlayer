@@ -1,74 +1,26 @@
 #include "input_manager.h"
 
 #include "driver/gpio.h"
-#include "esp_a2dp_api.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
-typedef struct {
-    uint8_t pin;
-    bool last_state;
-    bool pressed;
-    TickType_t last_change_time;
-    TickType_t press_start_time;
-    TickType_t last_click_time;
-    uint8_t click_count;
-    bool is_long_press;
-} button_state_t;
+#include "power_manager.h"
 
 static input_manager_cfg_t s_cfg;
 static bool s_initialized = false;
 
-static button_state_t s_vol_up_btn;
-static button_state_t s_vol_down_btn;
-
 static bool s_pwr_last_level = true;
 static TickType_t s_pwr_last_change_time = 0;
 static TickType_t s_pwr_press_start_time = 0;
+static TickType_t s_pwr_last_click_time = 0;
 static bool s_pwr_pressed = false;
 static bool s_pwr_hold_handled = false;
+static bool s_pwr_sleep_armed = false;
+static uint8_t s_pwr_click_count = 0;
 
-static uint32_t ticks_to_ms(TickType_t ticks)
+static bool led_pin_configured(void)
 {
-    return (uint32_t)ticks * (uint32_t)portTICK_PERIOD_MS;
-}
-
-static void handle_button(button_state_t *btn)
-{
-    bool current_state = gpio_get_level((gpio_num_t)btn->pin);
-    TickType_t now = xTaskGetTickCount();
-
-    if (current_state != btn->last_state) {
-        if ((now - btn->last_change_time) > pdMS_TO_TICKS(s_cfg.debounce_ms)) {
-            btn->last_change_time = now;
-            btn->last_state = current_state;
-
-            if (!current_state) {
-                btn->pressed = true;
-                btn->press_start_time = now;
-                btn->is_long_press = false;
-            } else if (btn->pressed) {
-                btn->pressed = false;
-
-                TickType_t press_duration = now - btn->press_start_time;
-                if (!btn->is_long_press &&
-                    press_duration < pdMS_TO_TICKS(s_cfg.long_click_threshold_ms)) {
-                    if ((now - btn->last_click_time) < pdMS_TO_TICKS(s_cfg.double_click_interval_ms)) {
-                        btn->click_count++;
-                    } else {
-                        btn->click_count = 1;
-                    }
-                    btn->last_click_time = now;
-                }
-            }
-        }
-    } else if (btn->pressed && !btn->is_long_press) {
-        TickType_t press_duration = now - btn->press_start_time;
-        if (press_duration >= pdMS_TO_TICKS(s_cfg.long_click_threshold_ms)) {
-            btn->is_long_press = true;
-        }
-    }
+    return s_cfg.led_gpio >= 0;
 }
 
 static void set_volume(uint8_t volume)
@@ -98,9 +50,7 @@ esp_err_t input_manager_init(const input_manager_cfg_t *cfg)
     s_cfg = *cfg;
 
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << s_cfg.pin_vol_up) |
-                        (1ULL << s_cfg.pin_vol_down) |
-                        (1ULL << s_cfg.pin_power),
+        .pin_bit_mask = (1ULL << s_cfg.pin_power),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -108,25 +58,18 @@ esp_err_t input_manager_init(const input_manager_cfg_t *cfg)
     };
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
-    s_vol_up_btn = (button_state_t){
-        .pin = (uint8_t)s_cfg.pin_vol_up,
-        .last_state = true,
-    };
-    s_vol_down_btn = (button_state_t){
-        .pin = (uint8_t)s_cfg.pin_vol_down,
-        .last_state = true,
-    };
-
     s_pwr_last_level = true;
     s_pwr_last_change_time = 0;
     s_pwr_press_start_time = 0;
+    s_pwr_last_click_time = 0;
     s_pwr_pressed = false;
     s_pwr_hold_handled = false;
+    s_pwr_sleep_armed = false;
+    s_pwr_click_count = 0;
 
     s_initialized = true;
 
-    ESP_LOGI(s_cfg.log_tag, "Botões configurados (VOL:%d/%d POWER:%d)",
-             s_cfg.pin_vol_up, s_cfg.pin_vol_down, s_cfg.pin_power);
+    ESP_LOGI(s_cfg.log_tag, "Botão POWER configurado (%d)", s_cfg.pin_power);
 
     return ESP_OK;
 }
@@ -165,15 +108,9 @@ void input_manager_task(void *pvParameter)
         return;
     }
 
-    ESP_LOGI(s_cfg.log_tag, "Task controle volume iniciada");
-
-    TickType_t last_process_time = xTaskGetTickCount();
-    TickType_t last_next_track_cmd = 0;
+    ESP_LOGI(s_cfg.log_tag, "Task de input iniciada");
 
     while (1) {
-        handle_button(&s_vol_up_btn);
-        handle_button(&s_vol_down_btn);
-
         TickType_t now = xTaskGetTickCount();
 
         bool pwr_level = gpio_get_level((gpio_num_t)s_cfg.pin_power);
@@ -186,66 +123,58 @@ void input_manager_task(void *pvParameter)
                 s_pwr_hold_handled = false;
                 s_pwr_press_start_time = now;
             } else {
+                TickType_t press_duration = now - s_pwr_press_start_time;
                 s_pwr_pressed = false;
                 s_pwr_hold_handled = false;
+
+                if (s_pwr_sleep_armed) {
+                    ESP_LOGW(s_cfg.log_tag, "Botão solto após hold: entrando em deep sleep");
+                    s_cfg.on_power_hold(true);
+                    if (led_pin_configured()) {
+                        pm_set_power_led((gpio_num_t)s_cfg.led_gpio, s_cfg.led_active_high, true);
+                    }
+                    s_pwr_sleep_armed = false;
+                    s_pwr_click_count = 0;
+                } else if (press_duration < pdMS_TO_TICKS(s_cfg.long_click_threshold_ms)) {
+                    if ((now - s_pwr_last_click_time) < pdMS_TO_TICKS(s_cfg.double_click_interval_ms)) {
+                        s_pwr_click_count++;
+                    } else {
+                        s_pwr_click_count = 1;
+                    }
+                    s_pwr_last_click_time = now;
+                }
             }
         }
 
         if (s_pwr_pressed && !s_pwr_hold_handled &&
             (now - s_pwr_press_start_time) > pdMS_TO_TICKS(s_cfg.power_hold_ms)) {
             s_pwr_hold_handled = true;
-            ESP_LOGW(s_cfg.log_tag, "Power hold detectado (%u ms)",
+            s_pwr_sleep_armed = true;
+            s_pwr_click_count = 0;
+            ESP_LOGW(s_cfg.log_tag, "Power hold confirmado (%u ms): aguardando soltar para dormir",
                      (unsigned)s_cfg.power_hold_ms);
-            s_cfg.on_power_hold(true);
-        }
-
-        if (s_vol_up_btn.click_count > 0 &&
-            now - s_vol_up_btn.last_click_time > pdMS_TO_TICKS(s_cfg.click_timeout_ms)) {
-            if (s_vol_up_btn.click_count == 2) {
-                if ((now - last_next_track_cmd) > pdMS_TO_TICKS(s_cfg.next_track_guard_ms)) {
-                    ESP_LOGI(s_cfg.log_tag, "Duplo clique: Música ALEATÓRIA");
-
-                    int cleared = (int)control_pending_count();
-                    control_flush();
-                    if (cleared > 0) {
-                        ESP_LOGI(s_cfg.log_tag, "Removidos %d comandos da queue", cleared);
-                    }
-
-                    control_enqueue(CMD_PLAY_NEXT, s_cfg.log_tag);
-                    last_next_track_cmd = now;
-                } else {
-                    ESP_LOGW(s_cfg.log_tag, "Duplo clique ignorado (aguarde %u ms)",
-                             (unsigned)s_cfg.next_track_guard_ms);
-                }
-            } else if (s_vol_up_btn.click_count == 1) {
-                input_manager_volume_up();
+            if (led_pin_configured()) {
+                pm_set_power_led((gpio_num_t)s_cfg.led_gpio, s_cfg.led_active_high, false);
             }
-            s_vol_up_btn.click_count = 0;
         }
 
-        if (s_vol_up_btn.is_long_press) {
-            input_manager_volume_up();
-            s_vol_up_btn.is_long_press = false;
-            vTaskDelay(pdMS_TO_TICKS(200));
+        if (!s_pwr_pressed &&
+            !s_pwr_sleep_armed &&
+            s_pwr_click_count > 0 &&
+            (now - s_pwr_last_click_time) > pdMS_TO_TICKS(s_cfg.click_timeout_ms)) {
+            if (s_pwr_click_count == 2) {
+                ESP_LOGI(s_cfg.log_tag, "Power: 2 cliques -> volume +");
+                input_manager_volume_up();
+            } else if (s_pwr_click_count == 3) {
+                ESP_LOGI(s_cfg.log_tag, "Power: 3 cliques -> volume -");
+                input_manager_volume_down();
+            } else {
+                ESP_LOGD(s_cfg.log_tag, "Power: sequencia ignorada (%u cliques)",
+                         (unsigned)s_pwr_click_count);
+            }
+            s_pwr_click_count = 0;
         }
 
-        if (s_vol_down_btn.click_count > 0 &&
-            now - s_vol_down_btn.last_click_time > pdMS_TO_TICKS(s_cfg.click_timeout_ms)) {
-            input_manager_volume_down();
-            s_vol_down_btn.click_count = 0;
-        }
-
-        if (s_vol_down_btn.is_long_press) {
-            input_manager_volume_down();
-            s_vol_down_btn.is_long_press = false;
-            vTaskDelay(pdMS_TO_TICKS(200));
-        }
-
-        if (now - last_process_time >= pdMS_TO_TICKS(50)) {
-            last_process_time = now;
-        }
-
-        (void)ticks_to_ms(now - last_process_time);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

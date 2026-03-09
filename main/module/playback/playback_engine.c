@@ -84,6 +84,9 @@ void playback_engine_decode_task(void *pvParameter)
     uint32_t last_stream_bytes = *s_ctx->total_bytes_streamed;
     uint32_t consecutive_short_writes = 0;
     *s_ctx->last_producer_tick = xTaskGetTickCount();
+    uint16_t pre_eof_no_sync_loops = 0;
+    uint16_t pre_eof_decode_err_loops = 0;
+    uint16_t pre_eof_underflow_loops = 0;
     uint16_t eof_no_sync_loops = 0;
     uint16_t eof_decode_err_loops = 0;
     uint16_t eof_underflow_loops = 0;
@@ -114,6 +117,48 @@ void playback_engine_decode_task(void *pvParameter)
 
         int offset = MP3FindSyncWord(*s_ctx->read_ptr, *s_ctx->bytes_left_in_mp3);
         if (offset < 0) {
+            if (feof(*s_ctx->current_file) &&
+                s_ctx->media_drop_trailing_tag_if_present(s_ctx->read_ptr, s_ctx->bytes_left_in_mp3, s_ctx->tag)) {
+                reached_eof = true;
+                exit_reason = "eof_prebuffer_trailing_tag";
+                break;
+            }
+
+            if (feof(*s_ctx->current_file)) {
+                pre_eof_no_sync_loops++;
+            } else {
+                pre_eof_no_sync_loops = 0;
+            }
+
+            if (!feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 >= s_ctx->mp3_critical_bytes) {
+                int drop = *s_ctx->bytes_left_in_mp3 - s_ctx->mp3_critical_bytes;
+                if (drop <= 0) {
+                    drop = s_ctx->mp3_no_sync_drop_bytes / 4;
+                    if (drop < 64) {
+                        drop = 64;
+                    }
+                }
+                if (drop > s_ctx->mp3_no_sync_drop_bytes) {
+                    drop = s_ctx->mp3_no_sync_drop_bytes;
+                }
+                if (drop > *s_ctx->bytes_left_in_mp3) {
+                    drop = *s_ctx->bytes_left_in_mp3;
+                }
+                if (drop > 0) {
+                    *s_ctx->read_ptr += drop;
+                    *s_ctx->bytes_left_in_mp3 -= drop;
+                    vTaskDelay(1);
+                    continue;
+                }
+            }
+
+            if (feof(*s_ctx->current_file) &&
+                (*s_ctx->bytes_left_in_mp3 < 4 || pre_eof_no_sync_loops > 30)) {
+                reached_eof = true;
+                exit_reason = "eof_prebuffer_no_sync";
+                break;
+            }
+
             if (feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 == 0) {
                 reached_eof = true;
                 exit_reason = "eof_prebuffer_no_sync";
@@ -122,6 +167,7 @@ void playback_engine_decode_task(void *pvParameter)
             vTaskDelay(1);
             continue;
         }
+        pre_eof_no_sync_loops = 0;
 
         *s_ctx->read_ptr += offset;
         *s_ctx->bytes_left_in_mp3 -= offset;
@@ -150,6 +196,62 @@ void playback_engine_decode_task(void *pvParameter)
                                        NULL);
 
             frame_count++;
+        } else {
+            if ((err == ERR_MP3_INDATA_UNDERFLOW || err == ERR_MP3_MAINDATA_UNDERFLOW) &&
+                feof(*s_ctx->current_file)) {
+                pre_eof_underflow_loops++;
+                if (s_ctx->media_drop_trailing_tag_if_present(s_ctx->read_ptr,
+                                                              s_ctx->bytes_left_in_mp3,
+                                                              s_ctx->tag)) {
+                    reached_eof = true;
+                    exit_reason = "eof_prebuffer_underflow_tag";
+                    break;
+                }
+                if (*s_ctx->bytes_left_in_mp3 < 4 || pre_eof_underflow_loops > 8) {
+                    reached_eof = true;
+                    exit_reason = "eof_prebuffer_underflow";
+                    break;
+                }
+                vTaskDelay(1);
+                continue;
+            } else {
+                pre_eof_underflow_loops = 0;
+            }
+
+            if (feof(*s_ctx->current_file)) {
+                pre_eof_decode_err_loops++;
+                if (s_ctx->media_drop_trailing_tag_if_present(s_ctx->read_ptr,
+                                                              s_ctx->bytes_left_in_mp3,
+                                                              s_ctx->tag)) {
+                    reached_eof = true;
+                    exit_reason = "eof_prebuffer_decodeerr_tag";
+                    break;
+                }
+            } else {
+                pre_eof_decode_err_loops = 0;
+            }
+
+            if (feof(*s_ctx->current_file) &&
+                (*s_ctx->bytes_left_in_mp3 < s_ctx->mp3_critical_bytes || pre_eof_decode_err_loops > 30)) {
+                reached_eof = true;
+                exit_reason = "eof_prebuffer_decodeerr";
+                break;
+            }
+
+            if (!feof(*s_ctx->current_file) && *s_ctx->bytes_left_in_mp3 > 0) {
+                int drop = s_ctx->mp3_no_sync_drop_bytes / 4;
+                if (drop < 64) {
+                    drop = 64;
+                }
+                if (drop > *s_ctx->bytes_left_in_mp3) {
+                    drop = *s_ctx->bytes_left_in_mp3;
+                }
+                *s_ctx->read_ptr += drop;
+                *s_ctx->bytes_left_in_mp3 -= drop;
+            }
+
+            vTaskDelay(1);
+            continue;
         }
     }
 
@@ -453,7 +555,7 @@ task_fail:
     *s_ctx->file_reader_task_handle = NULL;
     *s_ctx->audio_playing = false;
 
-    if (natural_finish && *s_ctx->bt_connected) {
+    if (natural_finish) {
         xEventGroupSetBits(*s_ctx->player_event_group, s_ctx->track_finished_bit);
     }
 

@@ -4,21 +4,19 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "driver/gpio.h"
 #include "esp_err.h"
 
-#include "control_queue.h"
-
 typedef struct {
-    int pin_vol_up;
-    int pin_vol_down;
     int pin_power;
+    int led_gpio;
+    bool led_active_high;
 
     uint32_t debounce_ms;
     uint32_t click_timeout_ms;
     uint32_t double_click_interval_ms;
     uint32_t long_click_threshold_ms;
     uint32_t power_hold_ms;
-    uint32_t next_track_guard_ms;
 
     uint8_t volume_step;
     uint8_t *volume_percent;
