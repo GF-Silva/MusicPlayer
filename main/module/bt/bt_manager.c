@@ -8,7 +8,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-#define DISCOVERY_INQ_LEN 10
+#define DISCOVERY_INQ_LEN 4
 
 static void bt_apply_default_pt_filter(void)
 {

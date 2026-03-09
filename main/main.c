@@ -101,7 +101,7 @@
 
 #define CONNECTION_RETRY_MAX 5
 #define FILE_READ_RETRY_MAX 3
-#define DISCOVERY_TIMEOUT_SEC 45
+#define DISCOVERY_TIMEOUT_SEC 12
 
 static const char *TAG = "MP3Player";
 

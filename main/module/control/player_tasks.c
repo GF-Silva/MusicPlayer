@@ -170,8 +170,8 @@ void player_tasks_control_task(void *pvParameter)
                     }
 
                     {
-                        uint32_t retry_delay_ms = 1200 + (*s_ctx->a2dp_open_fail_streak * 800);
-                        if (retry_delay_ms > 4000) retry_delay_ms = 4000;
+                        uint32_t retry_delay_ms = 700 + (*s_ctx->a2dp_open_fail_streak * 500);
+                        if (retry_delay_ms > 2000) retry_delay_ms = 2000;
                         vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
                     }
 
@@ -308,9 +308,9 @@ void player_tasks_main_task(void *pvParameter)
                                            s_ctx->bt_connected_bit,
                                            false,
                                            false,
-                                           pdMS_TO_TICKS(60000));
+                                           pdMS_TO_TICKS(12000));
     if (!(bits & s_ctx->bt_connected_bit)) {
-        ESP_LOGW(s_ctx->tag, "Sem conexão inicial em 60s, mantendo retries contínuos...");
+        ESP_LOGW(s_ctx->tag, "Sem conexão inicial em 12s, mantendo retries contínuos...");
         control_enqueue(CMD_RETRY_CONNECTION, s_ctx->tag);
         ESP_LOGI(s_ctx->tag, "Sistema iniciado sem BT (modo reconexão contínua).");
     } else {
@@ -411,6 +411,6 @@ void player_tasks_main_task(void *pvParameter)
             idle_without_bt_start = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }

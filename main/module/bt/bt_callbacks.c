@@ -49,8 +49,10 @@ void bt_callbacks_discovery_timeout_cb(TimerHandle_t xTimer)
     }
     ESP_LOGW(s_ctx->tag, "⏱️ Timeout de discovery");
     s_ctx->log_bt_state("disc_timeout");
-    if (!*s_ctx->device_found && !*s_ctx->bt_connected && *s_ctx->bt_connecting) {
-        s_ctx->set_bt_connecting(false);
+    if (!*s_ctx->device_found && !*s_ctx->bt_connected) {
+        if (*s_ctx->bt_connecting) {
+            s_ctx->set_bt_connecting(false);
+        }
         enqueue_cmd(CMD_RESTART_DISCOVERY);
     }
 }
@@ -122,6 +124,9 @@ void bt_callbacks_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *par
                 if (*s_ctx->connect_after_discovery_stop && *s_ctx->device_found && !*s_ctx->bt_connected) {
                     *s_ctx->connect_after_discovery_stop = false;
                     enqueue_cmd(CMD_CONNECT_TARGET);
+                } else if (!*s_ctx->device_found && !*s_ctx->bt_connected) {
+                    /* Discovery encerrou sem achar alvo: agenda novo ciclo imediatamente. */
+                    enqueue_cmd(CMD_RESTART_DISCOVERY);
                 }
             } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
                 *s_ctx->discovery_active = true;
