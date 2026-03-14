@@ -31,6 +31,7 @@
 #include <limits.h>
 
 #include "mp3dec.h"
+#include "app_config.h"
 #include "app_log.h"
 #include "ring_buffer.h"
 #include "media_library.h"
@@ -49,59 +50,7 @@
 #include "app_facade.h"
 #include "app_bootstrap.h"
 
-// Configurações do SD Card
-#define PIN_NUM_MISO 19
-#define PIN_NUM_MOSI 23
-#define PIN_NUM_CLK  18
-#define PIN_NUM_CS   4
-#define MOUNT_POINT "/sdcard"
-#define BOARD_LED_GPIO 2
-#define BOARD_LED_ACTIVE_HIGH 1
-
-#define PIN_PWR_SLEEP 33  // RTC IO: wakeup de deep sleep (botão ativo em LOW)
-#define DEBOUNCE_TIME_MS 50
-#define VOLUME_STEP 5
-#define POWER_HOLD_MS 2000
-#define AUTO_SLEEP_IDLE_MS (1 * 60 * 1000)  // 1 min sem BT/áudio -> deep sleep
-#define BT_CONNECTING_STUCK_MS (90 * 1000)  // destrava estado "conectando" preso
-#define DECODE_STALL_RECOVERY_MS (15 * 1000) // sem produzir PCM por muito tempo -> avançar faixa
-#define A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD 3
-#define PWR_RELEASE_WAIT_MS 5000
-
-#define DOUBLE_CLICK_INTERVAL_MS 300
-#define LONG_CLICK_THRESHOLD_MS 400
-
-
-// ✅ CONFIGURAÇÃO OTIMIZADA - FOCO EM BALANCEAR PRODUÇÃO/CONSUMO
-#define MP3_INPUT_BUFFER_SIZE     16384     // 16KB
-#define PCM_OUTPUT_BUFFER_SIZE    4608      // 4.6KB - 1 frame
-#define STREAM_BUFFER_SIZE        32278     // ~32KB
-#define A2DP_CHUNK_SIZE           512       // Controlado pelo IDF
-
-// ✅ THRESHOLDS MUITO REDUZIDOS: 30-60% (alvo: manter entre 30-60%)
-#define MP3_LOW_WATERMARK      30.0f  // Muito reduzido
-#define MP3_HIGH_WATERMARK    60.0f   // Muito reduzido
-
-#define MP3_READ_MIN          1024
-#define MP3_READ_MAX          16384
-
-#define MP3_CRITICAL_BYTES    4096
-#define MP3_NO_SYNC_DROP_BYTES 512
-#define PREBUFFER_FRAMES      10
-
-#define STREAM_REFILL_THRESHOLD   (STREAM_BUFFER_SIZE / 4)
 #define TICKS_TO_MS(t) ((uint32_t)(t) * (uint32_t)portTICK_PERIOD_MS)
-
-// Configuração do dispositivo alvo
-// O projeto está alinhado com ESP-IDF 5.4.2 e hoje prioriza descoberta por MAC.
-// O nome fica apenas como referência para logs/documentação.
-#define TARGET_DEVICE_NAME "TWS"  // Apenas para referência/logs
-#define TARGET_DEVICE_MAC  {0x41, 0x42, 0x78, 0xA4, 0x06, 0x97}
-#define PREFER_MAC_OVER_NAME true  // Mantido como true neste projeto
-
-#define CONNECTION_RETRY_MAX 5
-#define FILE_READ_RETRY_MAX 3
-#define DISCOVERY_TIMEOUT_SEC 12
 
 static const char *TAG = "MP3Player";
 
@@ -120,11 +69,11 @@ typedef struct {
 
 static system_status_t sys_status = {0};
 
-static uint8_t current_volume = 30;
-static float volume_scale = 0.30f;
+static uint8_t current_volume = APP_CONFIG_DEFAULT_VOLUME;
+static float volume_scale = APP_CONFIG_DEFAULT_VOLUME / 100.0f;
 
 static esp_bd_addr_t target_device_addr;
-static esp_bd_addr_t target_mac_addr = TARGET_DEVICE_MAC;
+static esp_bd_addr_t target_mac_addr = APP_CONFIG_TARGET_DEVICE_MAC;
 static bool device_found = false;
 static bool discovery_active = false;
 static bool connect_after_discovery_stop = false;
@@ -196,11 +145,11 @@ void app_main(void)
 
     esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
     if (wake == ESP_SLEEP_WAKEUP_EXT0) {
-        ESP_LOGI(TAG, "🔋 Wakeup por botão (EXT0 GPIO %d)", PIN_PWR_SLEEP);
-        if (!pm_require_hold_low((gpio_num_t)PIN_PWR_SLEEP, POWER_HOLD_MS, 20, TAG)) {
+        ESP_LOGI(TAG, "🔋 Wakeup por botão (EXT0 GPIO %d)", APP_CONFIG_POWER_WAKE_PIN);
+        if (!pm_require_hold_low((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, APP_CONFIG_POWER_HOLD_MS, 20, TAG)) {
             ESP_LOGI(TAG, "Wake curto: retornando para deep sleep");
-            pm_hold_led_off_during_sleep((gpio_num_t)BOARD_LED_GPIO, BOARD_LED_ACTIVE_HIGH);
-            pm_configure_ext0_wakeup((gpio_num_t)PIN_PWR_SLEEP, 0, TAG);
+            pm_hold_led_off_during_sleep((gpio_num_t)APP_CONFIG_BOARD_LED_GPIO, APP_CONFIG_BOARD_LED_ACTIVE_HIGH);
+            pm_configure_ext0_wakeup((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, 0, TAG);
             vTaskDelay(pdMS_TO_TICKS(40));
             esp_deep_sleep_start();
         }
@@ -209,7 +158,7 @@ void app_main(void)
     }
 
     // LED azul (GPIO2) como indicador principal de "ligado".
-    pm_set_power_led((gpio_num_t)BOARD_LED_GPIO, BOARD_LED_ACTIVE_HIGH, true);
+    pm_set_power_led((gpio_num_t)APP_CONFIG_BOARD_LED_GPIO, APP_CONFIG_BOARD_LED_ACTIVE_HIGH, true);
 
     app_log_apply_levels(TAG);
 
@@ -219,12 +168,12 @@ void app_main(void)
         .connection_timer = &connection_timer,
         .discovery_timer = &discovery_timer,
         .buffer_monitor_timer = &buffer_monitor_timer,
-        .discovery_timeout_sec = DISCOVERY_TIMEOUT_SEC,
-        .pwr_release_wait_ms = PWR_RELEASE_WAIT_MS,
-        .bt_connecting_stuck_ms = BT_CONNECTING_STUCK_MS,
-        .auto_sleep_idle_ms = AUTO_SLEEP_IDLE_MS,
-        .a2dp_open_fail_rediscovery_threshold = A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD,
-        .decode_stall_recovery_ms = DECODE_STALL_RECOVERY_MS,
+        .discovery_timeout_sec = APP_CONFIG_DISCOVERY_TIMEOUT_SEC,
+        .pwr_release_wait_ms = APP_CONFIG_PWR_RELEASE_WAIT_MS,
+        .bt_connecting_stuck_ms = APP_CONFIG_BT_CONNECTING_STUCK_MS,
+        .auto_sleep_idle_ms = APP_CONFIG_AUTO_SLEEP_IDLE_MS,
+        .a2dp_open_fail_rediscovery_threshold = APP_CONFIG_A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD,
+        .decode_stall_recovery_ms = APP_CONFIG_DECODE_STALL_RECOVERY_MS,
         .control_queue_len = 15,
         .sd_mounted = &sys_status.sd_mounted,
         .bt_initialized = &sys_status.bt_initialized,
@@ -271,20 +220,20 @@ void app_main(void)
         .buffer_low_events = &buffer_low_events,
         .buffer_high_events = &buffer_high_events,
         .playback_paused = &playback_paused,
-        .stream_buffer_size = STREAM_BUFFER_SIZE,
-        .stream_low_bytes = (STREAM_BUFFER_SIZE * 30) / 100,
-        .stream_high_bytes = (STREAM_BUFFER_SIZE * 60) / 100,
-        .mp3_input_buffer_size = MP3_INPUT_BUFFER_SIZE,
-        .pcm_output_buffer_size = PCM_OUTPUT_BUFFER_SIZE,
-        .prebuffer_frames = PREBUFFER_FRAMES,
-        .mp3_critical_bytes = MP3_CRITICAL_BYTES,
-        .mp3_read_min = MP3_READ_MIN,
-        .mp3_read_max = MP3_READ_MAX,
-        .mp3_no_sync_drop_bytes = MP3_NO_SYNC_DROP_BYTES,
-        .power_pin = PIN_PWR_SLEEP,
-        .board_led_gpio = BOARD_LED_GPIO,
-        .board_led_active_high = BOARD_LED_ACTIVE_HIGH,
-        .mount_point = MOUNT_POINT,
+        .stream_buffer_size = APP_CONFIG_STREAM_BUFFER_SIZE,
+        .stream_low_bytes = APP_CONFIG_STREAM_LOW_BYTES,
+        .stream_high_bytes = APP_CONFIG_STREAM_HIGH_BYTES,
+        .mp3_input_buffer_size = APP_CONFIG_MP3_INPUT_BUFFER_SIZE,
+        .pcm_output_buffer_size = APP_CONFIG_PCM_OUTPUT_BUFFER_SIZE,
+        .prebuffer_frames = APP_CONFIG_PREBUFFER_FRAMES,
+        .mp3_critical_bytes = APP_CONFIG_MP3_CRITICAL_BYTES,
+        .mp3_read_min = APP_CONFIG_MP3_READ_MIN,
+        .mp3_read_max = APP_CONFIG_MP3_READ_MAX,
+        .mp3_no_sync_drop_bytes = APP_CONFIG_MP3_NO_SYNC_DROP_BYTES,
+        .power_pin = APP_CONFIG_POWER_WAKE_PIN,
+        .board_led_gpio = APP_CONFIG_BOARD_LED_GPIO,
+        .board_led_active_high = APP_CONFIG_BOARD_LED_ACTIVE_HIGH,
+        .mount_point = APP_CONFIG_MOUNT_POINT,
         .max_path_len = 256,
         .bt_connected_bit = BT_CONNECTED_BIT,
         .track_finished_bit = TRACK_FINISHED_BIT,
@@ -308,11 +257,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Estruturas criadas");
     
     ret = sdcard_manager_mount_sdspi(TAG,
-                                     PIN_NUM_MOSI,
-                                     PIN_NUM_MISO,
-                                     PIN_NUM_CLK,
-                                     PIN_NUM_CS,
-                                     MOUNT_POINT,
+                                     APP_CONFIG_SD_PIN_MOSI,
+                                     APP_CONFIG_SD_PIN_MISO,
+                                     APP_CONFIG_SD_PIN_CLK,
+                                     APP_CONFIG_SD_PIN_CS,
+                                     APP_CONFIG_MOUNT_POINT,
                                      &sys_status.sd_mounted);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha SD Card: %s", esp_err_to_name(ret));
@@ -321,7 +270,7 @@ void app_main(void)
         return;
     }
     
-    ret = media_count_mp3_files(MOUNT_POINT, &mp3_count, TAG);
+    ret = media_count_mp3_files(APP_CONFIG_MOUNT_POINT, &mp3_count, TAG);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha escanear MP3s: %s", esp_err_to_name(ret));
         if (ret == ESP_ERR_NOT_FOUND) {
@@ -336,9 +285,9 @@ void app_main(void)
         return;
     }
     
-    ret = app_facade_init_audio_buffers(MP3_INPUT_BUFFER_SIZE,
-                                        PCM_OUTPUT_BUFFER_SIZE,
-                                        STREAM_BUFFER_SIZE);
+    ret = app_facade_init_audio_buffers(APP_CONFIG_MP3_INPUT_BUFFER_SIZE,
+                                        APP_CONFIG_PCM_OUTPUT_BUFFER_SIZE,
+                                        APP_CONFIG_STREAM_BUFFER_SIZE);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha buffers: %s", esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -378,15 +327,15 @@ void app_main(void)
     ESP_LOGI(TAG, "Tasks criadas");
 
     input_manager_cfg_t input_cfg = {
-        .pin_power = PIN_PWR_SLEEP,
-        .led_gpio = BOARD_LED_GPIO,
-        .led_active_high = BOARD_LED_ACTIVE_HIGH,
-        .debounce_ms = DEBOUNCE_TIME_MS,
+        .pin_power = APP_CONFIG_POWER_WAKE_PIN,
+        .led_gpio = APP_CONFIG_BOARD_LED_GPIO,
+        .led_active_high = APP_CONFIG_BOARD_LED_ACTIVE_HIGH,
+        .debounce_ms = APP_CONFIG_DEBOUNCE_MS,
         .click_timeout_ms = 500,
-        .double_click_interval_ms = DOUBLE_CLICK_INTERVAL_MS,
-        .long_click_threshold_ms = LONG_CLICK_THRESHOLD_MS,
-        .power_hold_ms = POWER_HOLD_MS,
-        .volume_step = VOLUME_STEP,
+        .double_click_interval_ms = APP_CONFIG_DOUBLE_CLICK_INTERVAL_MS,
+        .long_click_threshold_ms = APP_CONFIG_LONG_CLICK_THRESHOLD_MS,
+        .power_hold_ms = APP_CONFIG_POWER_HOLD_MS,
+        .volume_step = APP_CONFIG_VOLUME_STEP,
         .volume_percent = &current_volume,
         .volume_scale = &volume_scale,
         .log_tag = TAG,
@@ -399,7 +348,7 @@ void app_main(void)
         return;
     }
 
-    pm_configure_ext0_wakeup((gpio_num_t)PIN_PWR_SLEEP, 0, TAG);
+    pm_configure_ext0_wakeup((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, 0, TAG);
     
     if (xTaskCreatePinnedToCore(input_manager_task, "volume", 
                             3072, NULL, 3, NULL, 0) != pdPASS) {
@@ -415,7 +364,7 @@ void app_main(void)
     
     xTimerStart(buffer_monitor_timer, 0);
     
-    ESP_LOGI(TAG, "Iniciando busca BT: %s", TARGET_DEVICE_NAME);
+    ESP_LOGI(TAG, "Iniciando busca BT: %s", APP_CONFIG_TARGET_DEVICE_NAME);
     ret = app_facade_bluetooth_search_and_connect();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha busca: %s", esp_err_to_name(ret));
@@ -429,7 +378,7 @@ void app_main(void)
     ESP_LOGI(TAG, "   MAC alvo: %02X:%02X:%02X:%02X:%02X:%02X",
             target_mac_addr[0], target_mac_addr[1], target_mac_addr[2],
             target_mac_addr[3], target_mac_addr[4], target_mac_addr[5]);
-    ESP_LOGI(TAG, "   Referência: '%s'", TARGET_DEVICE_NAME);
+    ESP_LOGI(TAG, "   Referência: '%s'", APP_CONFIG_TARGET_DEVICE_NAME);
     ESP_LOGI(TAG, "");
     
     TickType_t last_check = xTaskGetTickCount();

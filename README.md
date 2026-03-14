@@ -97,6 +97,7 @@ O projeto usa a dependência `esp-libhelix-mp3` já incluída no repositório em
 
 ```bash
 idf.py set-target esp32
+idf.py menuconfig
 idf.py build
 idf.py -p /dev/SEU_PORTA flash monitor
 ```
@@ -111,14 +112,27 @@ idf.py -p /dev/SEU_PORTA flash monitor
 
 ## Configuração importante
 
-O dispositivo Bluetooth alvo está fixo no código em [`main/main.c`](/home/ferreira/Público/projetos/MusicPlayer/main/main.c).
+O dispositivo Bluetooth alvo agora pode ser ajustado via `idf.py menuconfig`, no menu `MusicPlayer Configuration`.
 
-Trecho relevante:
+Os campos mais importantes são:
 
-- `TARGET_DEVICE_NAME`
-- `TARGET_DEVICE_MAC`
+- nome do dispositivo de referência
+- `MAC address` do alvo
 
-Hoje o projeto prioriza a conexão por `MAC address`. Antes de publicar, vale deixar claro no seu post qual caixa de som/TWS foi usada nos testes e como o MAC deve ser alterado por quem quiser reproduzir o projeto.
+O projeto continua priorizando a conexão por `MAC address`. Antes de publicar, vale deixar claro no seu post qual caixa de som/TWS foi usada nos testes e qual `MAC` foi configurado.
+
+## Configuração via menuconfig
+
+As principais opções do projeto agora podem ser ajustadas em `idf.py menuconfig`:
+
+- nome do dispositivo Bluetooth de referência
+- `MAC address` do alvo
+- GPIOs do SD, botão e LED
+- volume inicial e passo de volume
+- timeouts de sleep, discovery e recovery
+- tamanhos dos buffers de áudio
+
+As opções ficam no menu `MusicPlayer Configuration`.
 
 ## Comportamento atual e limitações
 

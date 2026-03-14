@@ -1,0 +1,203 @@
+menu "MusicPlayer Configuration"
+
+    menu "Bluetooth Target"
+
+        config MUSICPLAYER_TARGET_DEVICE_NAME
+            string "Target device name"
+            default "TWS"
+            help
+                Friendly name used only for logs and documentation.
+
+        config MUSICPLAYER_TARGET_MAC_0
+            hex "Target MAC byte 0"
+            range 0x00 0xFF
+            default 0x41
+
+        config MUSICPLAYER_TARGET_MAC_1
+            hex "Target MAC byte 1"
+            range 0x00 0xFF
+            default 0x42
+
+        config MUSICPLAYER_TARGET_MAC_2
+            hex "Target MAC byte 2"
+            range 0x00 0xFF
+            default 0x78
+
+        config MUSICPLAYER_TARGET_MAC_3
+            hex "Target MAC byte 3"
+            range 0x00 0xFF
+            default 0xA4
+
+        config MUSICPLAYER_TARGET_MAC_4
+            hex "Target MAC byte 4"
+            range 0x00 0xFF
+            default 0x06
+
+        config MUSICPLAYER_TARGET_MAC_5
+            hex "Target MAC byte 5"
+            range 0x00 0xFF
+            default 0x97
+
+        config MUSICPLAYER_DISCOVERY_TIMEOUT_SEC
+            int "Discovery timeout (seconds)"
+            range 1 120
+            default 12
+
+        config MUSICPLAYER_BT_CONNECTING_STUCK_MS
+            int "Connecting watchdog (ms)"
+            range 1000 300000
+            default 90000
+
+        config MUSICPLAYER_A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD
+            int "Rediscovery after consecutive open failures"
+            range 1 20
+            default 3
+
+    endmenu
+
+    menu "Hardware Pins"
+
+        config MUSICPLAYER_PIN_SD_MISO
+            int "SD MISO GPIO"
+            range 0 39
+            default 19
+
+        config MUSICPLAYER_PIN_SD_MOSI
+            int "SD MOSI GPIO"
+            range 0 39
+            default 23
+
+        config MUSICPLAYER_PIN_SD_CLK
+            int "SD CLK GPIO"
+            range 0 39
+            default 18
+
+        config MUSICPLAYER_PIN_SD_CS
+            int "SD CS GPIO"
+            range 0 39
+            default 4
+
+        config MUSICPLAYER_PIN_POWER_WAKE
+            int "Power/Wakeup GPIO"
+            range 0 39
+            default 33
+
+        config MUSICPLAYER_PIN_STATUS_LED
+            int "Status LED GPIO"
+            range -1 39
+            default 2
+
+        config MUSICPLAYER_LED_ACTIVE_HIGH
+            bool "Status LED is active high"
+            default y
+
+        config MUSICPLAYER_MOUNT_POINT
+            string "SD mount point"
+            default "/sdcard"
+
+    endmenu
+
+    menu "Input and Power"
+
+        config MUSICPLAYER_DEFAULT_VOLUME
+            int "Default volume (%)"
+            range 0 100
+            default 30
+
+        config MUSICPLAYER_VOLUME_STEP
+            int "Volume step (%)"
+            range 1 100
+            default 5
+
+        config MUSICPLAYER_DEBOUNCE_MS
+            int "Button debounce (ms)"
+            range 1 1000
+            default 50
+
+        config MUSICPLAYER_DOUBLE_CLICK_INTERVAL_MS
+            int "Double-click interval (ms)"
+            range 50 2000
+            default 300
+
+        config MUSICPLAYER_LONG_CLICK_THRESHOLD_MS
+            int "Short/long click threshold (ms)"
+            range 50 5000
+            default 400
+
+        config MUSICPLAYER_POWER_HOLD_MS
+            int "Power hold to sleep (ms)"
+            range 100 10000
+            default 2000
+
+        config MUSICPLAYER_PWR_RELEASE_WAIT_MS
+            int "Wait for button release before sleep (ms)"
+            range 100 10000
+            default 5000
+
+        config MUSICPLAYER_AUTO_SLEEP_IDLE_MS
+            int "Auto-sleep idle timeout (ms)"
+            range 1000 3600000
+            default 60000
+
+    endmenu
+
+    menu "Audio Pipeline"
+
+        config MUSICPLAYER_MP3_INPUT_BUFFER_SIZE
+            int "MP3 input buffer size (bytes)"
+            range 1024 65536
+            default 16384
+
+        config MUSICPLAYER_PCM_OUTPUT_BUFFER_SIZE
+            int "PCM output buffer size (bytes)"
+            range 1024 16384
+            default 4608
+
+        config MUSICPLAYER_STREAM_BUFFER_SIZE
+            int "Stream buffer size (bytes)"
+            range 4096 131072
+            default 32278
+
+        config MUSICPLAYER_STREAM_LOW_WATERMARK_PCT
+            int "Stream low watermark (%)"
+            range 1 99
+            default 30
+
+        config MUSICPLAYER_STREAM_HIGH_WATERMARK_PCT
+            int "Stream high watermark (%)"
+            range 1 99
+            default 60
+
+        config MUSICPLAYER_MP3_READ_MIN
+            int "Minimum MP3 read size (bytes)"
+            range 64 65536
+            default 1024
+
+        config MUSICPLAYER_MP3_READ_MAX
+            int "Maximum MP3 read size (bytes)"
+            range 64 65536
+            default 16384
+
+        config MUSICPLAYER_MP3_CRITICAL_BYTES
+            int "Critical MP3 buffer threshold (bytes)"
+            range 64 65536
+            default 4096
+
+        config MUSICPLAYER_MP3_NO_SYNC_DROP_BYTES
+            int "No-sync recovery drop size (bytes)"
+            range 64 4096
+            default 512
+
+        config MUSICPLAYER_PREBUFFER_FRAMES
+            int "Prebuffer frames"
+            range 1 100
+            default 10
+
+        config MUSICPLAYER_DECODE_STALL_RECOVERY_MS
+            int "Decode stall recovery timeout (ms)"
+            range 1000 120000
+            default 15000
+
+    endmenu
+
+endmenu
