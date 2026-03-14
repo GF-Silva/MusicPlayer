@@ -93,11 +93,11 @@
 #define TICKS_TO_MS(t) ((uint32_t)(t) * (uint32_t)portTICK_PERIOD_MS)
 
 // Configuração do dispositivo alvo
-// ✅ IDF 4.4.4: Usa apenas MAC address para descoberta
-// (Campo EIR não disponível nesta versão do IDF)
+// O projeto está alinhado com ESP-IDF 5.4.2 e hoje prioriza descoberta por MAC.
+// O nome fica apenas como referência para logs/documentação.
 #define TARGET_DEVICE_NAME "TWS"  // Apenas para referência/logs
 #define TARGET_DEVICE_MAC  {0x41, 0x42, 0x78, 0xA4, 0x06, 0x97}
-#define PREFER_MAC_OVER_NAME true  // Sempre true no IDF 4.4.4
+#define PREFER_MAC_OVER_NAME true  // Mantido como true neste projeto
 
 #define CONNECTION_RETRY_MAX 5
 #define FILE_READ_RETRY_MAX 3

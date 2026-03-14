@@ -53,6 +53,7 @@ __pycache__/
 *.tmp
 *.orig
 *~
+.cache/
 
 # User-specific ESP-IDF local config
 /esp_idf_project_configuration.json
