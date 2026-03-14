@@ -105,7 +105,7 @@ idf.py -p /dev/SEU_PORTA flash monitor
 ## Como usar
 
 1. Coloque arquivos `.mp3` na raiz do cartão `microSD`.
-2. Ajuste no código o `MAC` do dispositivo Bluetooth alvo.
+2. Ajuste no `idf.py menuconfig` o `MAC` do dispositivo Bluetooth alvo.
 3. Grave o firmware no `ESP32`.
 4. Ligue o dispositivo.
 5. Aguarde o discovery e a conexão Bluetooth.
@@ -138,7 +138,7 @@ As opções ficam no menu `MusicPlayer Configuration`.
 
 - Os arquivos `.mp3` são buscados somente na raiz de `/sdcard`
 - A próxima faixa é escolhida de forma aleatória
-- O projeto depende de um dispositivo Bluetooth específico configurado no código
+- O projeto depende de um dispositivo Bluetooth alvo configurado no `menuconfig`
 - A compatibilidade de amostragem é validada para `44.1 kHz` e `48 kHz`
 - O auto-sleep ocorre após aproximadamente `1 minuto` sem Bluetooth/áudio
 - Não há interface gráfica, display ou menu local
