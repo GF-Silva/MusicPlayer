@@ -49,6 +49,8 @@
 #include "player_tasks.h"
 #include "app_facade.h"
 #include "app_bootstrap.h"
+#include "app_mode.h"
+#include "wifi_ap_manager.h"
 
 #define TICKS_TO_MS(t) ((uint32_t)(t) * (uint32_t)portTICK_PERIOD_MS)
 
@@ -134,6 +136,110 @@ static TimerHandle_t connection_timer;
 static TimerHandle_t discovery_timer;
 static TimerHandle_t buffer_monitor_timer;
 
+static void enter_deep_sleep_minimal(bool from_power_button)
+{
+    ESP_LOGW(TAG, "Entrando em deep sleep");
+
+    uint32_t wait_ms = from_power_button ? APP_CONFIG_PWR_RELEASE_WAIT_MS : 600;
+    if (!pm_wait_pin_inactive((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, wait_ms, TAG)) {
+        ESP_LOGW(TAG, "Deep sleep cancelado: botão wake permaneceu LOW");
+        return;
+    }
+
+    pm_hold_led_off_during_sleep((gpio_num_t)APP_CONFIG_BOARD_LED_GPIO, APP_CONFIG_BOARD_LED_ACTIVE_HIGH);
+    pm_configure_ext0_wakeup((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, 0, TAG);
+
+    vTaskDelay(pdMS_TO_TICKS(80));
+    esp_deep_sleep_start();
+}
+
+static esp_err_t mount_sd_or_restart(void)
+{
+    esp_err_t ret = sdcard_manager_mount_sdspi(TAG,
+                                               APP_CONFIG_SD_PIN_MOSI,
+                                               APP_CONFIG_SD_PIN_MISO,
+                                               APP_CONFIG_SD_PIN_CLK,
+                                               APP_CONFIG_SD_PIN_CS,
+                                               APP_CONFIG_MOUNT_POINT,
+                                               &sys_status.sd_mounted);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha SD Card: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+    return ret;
+}
+
+static esp_err_t start_input_task(void (*on_power_hold)(bool), const char *task_name)
+{
+    input_manager_cfg_t input_cfg = {
+        .pin_power = APP_CONFIG_POWER_WAKE_PIN,
+        .led_gpio = APP_CONFIG_BOARD_LED_GPIO,
+        .led_active_high = APP_CONFIG_BOARD_LED_ACTIVE_HIGH,
+        .debounce_ms = APP_CONFIG_DEBOUNCE_MS,
+        .click_timeout_ms = 500,
+        .double_click_interval_ms = APP_CONFIG_DOUBLE_CLICK_INTERVAL_MS,
+        .long_click_threshold_ms = APP_CONFIG_LONG_CLICK_THRESHOLD_MS,
+        .power_hold_ms = APP_CONFIG_POWER_HOLD_MS,
+        .volume_step = APP_CONFIG_VOLUME_STEP,
+        .volume_percent = &current_volume,
+        .volume_scale = &volume_scale,
+        .log_tag = TAG,
+        .on_power_hold = on_power_hold,
+        .on_wifi_toggle = app_mode_toggle_wifi_ap_and_restart,
+    };
+
+    esp_err_t ret = input_manager_init(&input_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha init input manager");
+        return ret;
+    }
+
+    pm_configure_ext0_wakeup((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, 0, TAG);
+
+    if (xTaskCreatePinnedToCore(input_manager_task, task_name,
+                                3072, NULL, 3, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Falha task input");
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static void start_wifi_ap_mode(void)
+{
+    ESP_LOGW(TAG, "Modo WiFi AP ativo; Bluetooth/audio não serão inicializados");
+
+    mount_sd_or_restart();
+
+    esp_err_t ret = start_input_task(enter_deep_sleep_minimal, "input_wifi");
+    if (ret != ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+        return;
+    }
+
+    ret = wifi_ap_manager_start(&(wifi_ap_manager_cfg_t){
+        .tag = TAG,
+        .ssid = APP_CONFIG_WIFI_AP_SSID,
+        .password = APP_CONFIG_WIFI_AP_PASSWORD,
+        .channel = APP_CONFIG_WIFI_AP_CHANNEL,
+        .max_connections = APP_CONFIG_WIFI_AP_MAX_CONN,
+    });
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha modo WiFi AP: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Modo WiFi AP iniciado. Acesse http://192.168.4.1/");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        ESP_LOGI(TAG, "WiFi AP: Heap=%lu", (unsigned long)esp_get_free_heap_size());
+    }
+}
+
 // ============================================================================
 // APP MAIN
 // ============================================================================
@@ -162,7 +268,27 @@ void app_main(void)
 
     app_log_apply_levels(TAG);
 
-    esp_err_t ret = app_bootstrap_init(&(app_bootstrap_ctx_t){
+    esp_err_t ret = app_mode_nvs_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha NVS: %s", esp_err_to_name(ret));
+        esp_restart();
+        return;
+    }
+
+    bool wifi_ap_enabled = false;
+    ret = app_mode_wifi_ap_is_enabled(&wifi_ap_enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha lendo modo WiFi AP: %s", esp_err_to_name(ret));
+        esp_restart();
+        return;
+    }
+
+    if (wifi_ap_enabled) {
+        start_wifi_ap_mode();
+        return;
+    }
+
+    ret = app_bootstrap_init(&(app_bootstrap_ctx_t){
         .tag = TAG,
         .player_event_group = &player_event_group,
         .connection_timer = &connection_timer,
@@ -256,17 +382,8 @@ void app_main(void)
     
     ESP_LOGI(TAG, "Estruturas criadas");
     
-    ret = sdcard_manager_mount_sdspi(TAG,
-                                     APP_CONFIG_SD_PIN_MOSI,
-                                     APP_CONFIG_SD_PIN_MISO,
-                                     APP_CONFIG_SD_PIN_CLK,
-                                     APP_CONFIG_SD_PIN_CS,
-                                     APP_CONFIG_MOUNT_POINT,
-                                     &sys_status.sd_mounted);
+    ret = mount_sd_or_restart();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha SD Card: %s", esp_err_to_name(ret));
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_restart();
         return;
     }
     
@@ -326,33 +443,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Tasks criadas");
 
-    input_manager_cfg_t input_cfg = {
-        .pin_power = APP_CONFIG_POWER_WAKE_PIN,
-        .led_gpio = APP_CONFIG_BOARD_LED_GPIO,
-        .led_active_high = APP_CONFIG_BOARD_LED_ACTIVE_HIGH,
-        .debounce_ms = APP_CONFIG_DEBOUNCE_MS,
-        .click_timeout_ms = 500,
-        .double_click_interval_ms = APP_CONFIG_DOUBLE_CLICK_INTERVAL_MS,
-        .long_click_threshold_ms = APP_CONFIG_LONG_CLICK_THRESHOLD_MS,
-        .power_hold_ms = APP_CONFIG_POWER_HOLD_MS,
-        .volume_step = APP_CONFIG_VOLUME_STEP,
-        .volume_percent = &current_volume,
-        .volume_scale = &volume_scale,
-        .log_tag = TAG,
-        .on_power_hold = app_facade_input_on_power_hold,
-    };
-    if (input_manager_init(&input_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Falha init input manager");
-        app_facade_cleanup_audio_buffers();
-        esp_restart();
-        return;
-    }
-
-    pm_configure_ext0_wakeup((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, 0, TAG);
-    
-    if (xTaskCreatePinnedToCore(input_manager_task, "volume", 
-                            3072, NULL, 3, NULL, 0) != pdPASS) {
-        ESP_LOGE(TAG, "Falha task volume");
+    if (start_input_task(app_facade_input_on_power_hold, "volume") != ESP_OK) {
         app_facade_cleanup_audio_buffers();
         esp_restart();
         return;

@@ -17,6 +17,8 @@ idf_component_register(
         "module/power/power_manager.c"
         "module/power/sleep_manager.c"
         "module/storage/sdcard_manager.c"
+        "module/system/app_mode.c"
+        "module/wifi/wifi_ap_manager.c"
     INCLUDE_DIRS
         "."
         "module/audio"
@@ -28,8 +30,14 @@ idf_component_register(
         "module/playback"
         "module/power"
         "module/storage"
+        "module/system"
+        "module/wifi"
+    EMBED_TXTFILES
+        "web/index.html"
     REQUIRES 
         bt
+        esp_http_server
+        esp_netif
         esp_wifi
         fatfs
         driver

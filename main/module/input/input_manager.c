@@ -168,6 +168,11 @@ void input_manager_task(void *pvParameter)
             } else if (s_pwr_click_count == 3) {
                 ESP_LOGI(s_cfg.log_tag, "Power: 3 cliques -> volume -");
                 input_manager_volume_down();
+            } else if (s_pwr_click_count == 5) {
+                ESP_LOGI(s_cfg.log_tag, "Power: 5 cliques -> wifi mode");
+                if (s_cfg.on_wifi_toggle) {
+                    s_cfg.on_wifi_toggle();
+                }
             } else {
                 ESP_LOGD(s_cfg.log_tag, "Power: sequencia ignorada (%u cliques)",
                          (unsigned)s_pwr_click_count);

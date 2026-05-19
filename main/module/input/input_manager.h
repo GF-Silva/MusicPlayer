@@ -24,6 +24,7 @@ typedef struct {
 
     const char *log_tag;
     void (*on_power_hold)(bool from_power_button);
+    void (*on_wifi_toggle)(void);
 } input_manager_cfg_t;
 
 esp_err_t input_manager_init(const input_manager_cfg_t *cfg);

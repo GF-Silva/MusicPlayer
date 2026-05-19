@@ -141,6 +141,30 @@ menu "MusicPlayer Configuration"
 
     endmenu
 
+    menu "WiFi AP"
+
+        config MUSICPLAYER_WIFI_AP_SSID
+            string "WiFi AP SSID"
+            default "ESP32-MusicPlayer"
+
+        config MUSICPLAYER_WIFI_AP_PASSWORD
+            string "WiFi AP password"
+            default "music1234"
+            help
+                WPA/WPA2 password for AP mode. Use at least 8 characters.
+
+        config MUSICPLAYER_WIFI_AP_CHANNEL
+            int "WiFi AP channel"
+            range 1 13
+            default 6
+
+        config MUSICPLAYER_WIFI_AP_MAX_CONN
+            int "WiFi AP max connections"
+            range 1 4
+            default 2
+
+    endmenu
+
     menu "Audio Pipeline"
 
         config MUSICPLAYER_MP3_INPUT_BUFFER_SIZE

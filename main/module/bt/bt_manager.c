@@ -6,7 +6,6 @@
 #include "esp_bt_main.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 
 #define DISCOVERY_INQ_LEN 4
 
@@ -33,7 +32,6 @@ esp_err_t bt_manager_init(bt_manager_t *mgr)
 
     ESP_LOGI(mgr->tag, "Inicializando Bluetooth...");
 
-    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
