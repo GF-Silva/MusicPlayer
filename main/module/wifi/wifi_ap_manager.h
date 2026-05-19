@@ -9,6 +9,7 @@ typedef struct {
     const char *tag;
     const char *ssid;
     const char *password;
+    const char *mount_point;
     uint8_t channel;
     uint8_t max_connections;
 } wifi_ap_manager_cfg_t;

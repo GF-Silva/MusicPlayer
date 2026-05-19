@@ -9,7 +9,7 @@ def chunk_generator():
         time.sleep(0.5)
 
 def test_esp32_stream():
-    url = "http://192.168.4.1/put-musics"
+    url = "http://192.168.4.1/musics?nome=teste_stream.mp3"
     
     # Session mantém a conexão aberta e é mais estável para streaming
     session = requests.Session()

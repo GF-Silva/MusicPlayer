@@ -18,6 +18,7 @@ idf_component_register(
         "module/power/sleep_manager.c"
         "module/storage/sdcard_manager.c"
         "module/system/app_mode.c"
+        "module/system/system_config_manager.c"
         "module/wifi/wifi_ap_manager.c"
     INCLUDE_DIRS
         "."

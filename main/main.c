@@ -50,6 +50,7 @@
 #include "app_facade.h"
 #include "app_bootstrap.h"
 #include "app_mode.h"
+#include "system_config_manager.h"
 #include "wifi_ap_manager.h"
 
 #define TICKS_TO_MS(t) ((uint32_t)(t) * (uint32_t)portTICK_PERIOD_MS)
@@ -136,6 +137,34 @@ static TimerHandle_t connection_timer;
 static TimerHandle_t discovery_timer;
 static TimerHandle_t buffer_monitor_timer;
 
+static system_config_defaults_t build_system_config_defaults(void)
+{
+    const uint8_t mac[6] = APP_CONFIG_TARGET_DEVICE_MAC;
+    system_config_defaults_t defaults = {
+        .bt_device = APP_CONFIG_TARGET_DEVICE_NAME,
+        .sd_mount_point = APP_CONFIG_MOUNT_POINT,
+        .music_mount_point = "musics",
+        .wifi_ssid = APP_CONFIG_WIFI_AP_SSID,
+        .wifi_password = APP_CONFIG_WIFI_AP_PASSWORD,
+        .wifi_channel = APP_CONFIG_WIFI_AP_CHANNEL,
+        .wifi_max_connections = APP_CONFIG_WIFI_AP_MAX_CONN,
+        .default_volume = APP_CONFIG_DEFAULT_VOLUME,
+        .volume_step = APP_CONFIG_VOLUME_STEP,
+        .auto_sleep_idle_ms = APP_CONFIG_AUTO_SLEEP_IDLE_MS,
+        .discovery_timeout_sec = APP_CONFIG_DISCOVERY_TIMEOUT_SEC,
+        .bt_connecting_stuck_ms = APP_CONFIG_BT_CONNECTING_STUCK_MS,
+        .decode_stall_recovery_ms = APP_CONFIG_DECODE_STALL_RECOVERY_MS,
+        .stream_buffer_size = APP_CONFIG_STREAM_BUFFER_SIZE,
+        .stream_low_watermark_pct = APP_CONFIG_STREAM_LOW_WATERMARK_PCT,
+        .stream_high_watermark_pct = APP_CONFIG_STREAM_HIGH_WATERMARK_PCT,
+        .mp3_read_min = APP_CONFIG_MP3_READ_MIN,
+        .mp3_read_max = APP_CONFIG_MP3_READ_MAX,
+    };
+
+    memcpy(defaults.target_mac, mac, sizeof(defaults.target_mac));
+    return defaults;
+}
+
 static void enter_deep_sleep_minimal(bool from_power_button)
 {
     ESP_LOGW(TAG, "Entrando em deep sleep");
@@ -167,6 +196,15 @@ static esp_err_t mount_sd_or_restart(void)
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
+
+    system_config_defaults_t defaults = build_system_config_defaults();
+    ret = system_config_ensure(APP_CONFIG_MOUNT_POINT, &defaults, TAG);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha preparando configs do SD: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
     return ret;
 }
 
@@ -223,6 +261,7 @@ static void start_wifi_ap_mode(void)
         .tag = TAG,
         .ssid = APP_CONFIG_WIFI_AP_SSID,
         .password = APP_CONFIG_WIFI_AP_PASSWORD,
+        .mount_point = APP_CONFIG_MOUNT_POINT,
         .channel = APP_CONFIG_WIFI_AP_CHANNEL,
         .max_connections = APP_CONFIG_WIFI_AP_MAX_CONN,
     });
