@@ -40,6 +40,8 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+/.codex
+/managed_components
 
 # Local env / secrets
 .env

@@ -45,4 +45,5 @@ idf_component_register(
         nvs_flash
         sdmmc
         esp-libhelix-mp3
+        cjson
 )

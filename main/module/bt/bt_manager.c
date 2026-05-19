@@ -59,6 +59,7 @@ esp_err_t bt_manager_init(bt_manager_t *mgr)
         ESP_LOGE(mgr->tag, "Bluedroid enable: %s", esp_err_to_name(ret));
         return ret;
     }
+    esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
 
     ret = esp_bt_gap_set_device_name("ESP32_MP3");
     if (ret != ESP_OK) {
