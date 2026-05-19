@@ -79,7 +79,7 @@
         align-items: center;
         justify-content: space-between;
         gap: 16px;
-        margin-bottom: 28px;
+        margin-bottom: 14px;
       }
 
       h1,
@@ -105,6 +105,41 @@
         color: var(--muted);
         font-size: 0.9rem;
         text-align: right;
+      }
+
+      .top-nav {
+        position: sticky;
+        top: 0;
+        z-index: 5;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 24px;
+        padding: 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(10px);
+      }
+
+      .nav-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .nav-button {
+        min-height: 36px;
+        padding: 0 12px;
+      }
+
+      .nav-button.active {
+        border-color: var(--accent);
+        background: #e7f6f7;
+        color: var(--accent-strong);
       }
 
       .home {
@@ -292,6 +327,7 @@
 
       @media (max-width: 760px) {
         header,
+        .top-nav,
         .toolbar {
           align-items: flex-start;
           flex-direction: column;
@@ -321,6 +357,16 @@
         </div>
         <div class="status" id="status">Pronto</div>
       </header>
+
+      <nav class="top-nav" aria-label="Navegacao principal">
+        <button id="back-button" class="nav-button" type="button" disabled>Voltar</button>
+        <div class="nav-group">
+          <button class="nav-button active" type="button" data-route="home-view">Inicio</button>
+          <button class="nav-button" type="button" data-route="music-view">Musicas</button>
+          <button class="nav-button" type="button" data-route="config-view">Configs</button>
+          <button class="nav-button" type="button" data-route="error-view">Erros</button>
+        </div>
+      </nav>
 
       <main>
         <section id="home-view" class="view active home">
@@ -396,9 +442,12 @@
         selected: new Set(),
         uploadQueue: [],
         busy: false,
+        currentView: "home-view",
+        history: [],
       };
 
       const statusEl = document.querySelector("#status");
+      const backButtonEl = document.querySelector("#back-button");
       const musicListEl = document.querySelector("#music-list");
       const queueListEl = document.querySelector("#queue-list");
       const fileInputEl = document.querySelector("#music-files");
@@ -410,13 +459,35 @@
         statusEl.className = `status ${kind}`;
       }
 
-      function showView(id) {
+      function updateNavigation() {
+        document.querySelectorAll(".nav-button[data-route]").forEach((button) => {
+          button.classList.toggle("active", button.dataset.route === state.currentView);
+        });
+        backButtonEl.disabled = state.history.length === 0;
+      }
+
+      function showView(id, options = {}) {
+        if (id === state.currentView) {
+          return;
+        }
+
+        if (options.pushHistory !== false) {
+          state.history.push(state.currentView);
+        }
+
         document.querySelectorAll(".view").forEach((view) => view.classList.remove("active"));
         document.getElementById(id).classList.add("active");
+        state.currentView = id;
+        updateNavigation();
 
         if (id === "music-view") loadMusics();
         if (id === "config-view") loadConfig();
         if (id === "error-view") loadErrors();
+      }
+
+      function goBack() {
+        const previous = state.history.pop() || "home-view";
+        showView(previous, { pushHistory: false });
       }
 
       function renderMusics() {
@@ -594,6 +665,7 @@
         button.addEventListener("click", () => showView(button.dataset.route));
       });
 
+      backButtonEl.addEventListener("click", goBack);
       document.querySelector("#refresh-musics").addEventListener("click", loadMusics);
       document.querySelector("#upload-queue").addEventListener("click", uploadQueue);
       document.querySelector("#delete-selected").addEventListener("click", deleteSelected);
@@ -612,6 +684,7 @@
       });
 
       renderQueue();
+      updateNavigation();
     </script>
   </body>
 </html>
