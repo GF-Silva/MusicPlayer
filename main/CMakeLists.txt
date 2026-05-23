@@ -33,7 +33,7 @@ idf_component_register(
         "module/storage"
         "module/system"
         "module/wifi"
-    EMBED_TXTFILES
+    EMBED_FILES
         "web/index.html"
     REQUIRES 
         bt

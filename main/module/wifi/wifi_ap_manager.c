@@ -18,12 +18,14 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 #include "cJSON.h"
 #include "system_config_manager.h"
 
 #define MUSIC_UPLOAD_CHUNK_SIZE 1024
-#define MUSIC_MAX_NAME_LEN 96
+#define MUSIC_MAX_NAME_LEN 176
 #define MUSIC_MAX_PATH_LEN 192
+#define MUSIC_QUERY_VALUE_LEN 512
 #define MUSIC_AUTHOR_LEN 128
 #define MUSIC_LOGO_MIME_LEN 40
 #define WIFI_CONFIG_MAX_BODY_SIZE 4096
@@ -68,7 +70,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     const size_t html_len = (size_t)(index_html_end - index_html_start);
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
     return httpd_resp_send(req, (const char *)index_html_start, html_len);
 }
 
@@ -83,9 +86,11 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     return ret;
 }
 
-static bool is_unreserved_filename_char(char c)
+static bool is_invalid_filename_byte(unsigned char c)
 {
-    return isalnum((unsigned char)c) || c == ' ' || c == '.' || c == '_' || c == '-';
+    return c < 0x20 || c == 0x7F ||
+           c == '"' || c == '*' || c == '/' || c == ':' ||
+           c == '<' || c == '>' || c == '?' || c == '\\' || c == '|';
 }
 
 static int from_hex(char c)
@@ -96,14 +101,18 @@ static int from_hex(char c)
     return -1;
 }
 
-static void url_decode_inplace(char *s)
+static bool url_decode_inplace(char *s)
 {
     char *dst = s;
     char *src = s;
 
     while (*src) {
         if (src[0] == '%' && isxdigit((unsigned char)src[1]) && isxdigit((unsigned char)src[2])) {
-            *dst++ = (char)((from_hex(src[1]) << 4) | from_hex(src[2]));
+            char decoded = (char)((from_hex(src[1]) << 4) | from_hex(src[2]));
+            if (decoded == '\0') {
+                return false;
+            }
+            *dst++ = decoded;
             src += 3;
         } else if (*src == '+') {
             *dst++ = ' ';
@@ -113,6 +122,7 @@ static void url_decode_inplace(char *s)
         }
     }
     *dst = '\0';
+    return true;
 }
 
 static bool is_valid_music_filename(const char *name)
@@ -131,7 +141,7 @@ static bool is_valid_music_filename(const char *name)
     }
 
     for (size_t i = 0; i < len; i++) {
-        if (!is_unreserved_filename_char(name[i])) {
+        if (is_invalid_filename_byte((unsigned char)name[i])) {
             return false;
         }
     }
@@ -155,8 +165,8 @@ static esp_err_t make_music_path(const char *name, char *path, size_t path_len)
 
 static esp_err_t get_music_name_from_request(httpd_req_t *req, char *name, size_t name_len, bool allow_body)
 {
-    char query[160] = {0};
-    char value[MUSIC_MAX_NAME_LEN + 1] = {0};
+    char query[CONFIG_HTTPD_MAX_URI_LEN + 1] = {0};
+    char value[MUSIC_QUERY_VALUE_LEN] = {0};
 
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         if (httpd_query_key_value(query, "nome", value, sizeof(value)) != ESP_OK &&
@@ -166,8 +176,7 @@ static esp_err_t get_music_name_from_request(httpd_req_t *req, char *name, size_
         }
 
         if (value[0] != '\0') {
-            url_decode_inplace(value);
-            if (!is_valid_music_filename(value)) {
+            if (!url_decode_inplace(value) || !is_valid_music_filename(value)) {
                 return ESP_ERR_INVALID_ARG;
             }
             strlcpy(name, value, name_len);
@@ -177,8 +186,7 @@ static esp_err_t get_music_name_from_request(httpd_req_t *req, char *name, size_
 
     if (httpd_req_get_hdr_value_str(req, "X-Filename", value, sizeof(value)) == ESP_OK ||
         httpd_req_get_hdr_value_str(req, "X-Music-Name", value, sizeof(value)) == ESP_OK) {
-        url_decode_inplace(value);
-        if (!is_valid_music_filename(value)) {
+        if (!url_decode_inplace(value) || !is_valid_music_filename(value)) {
             return ESP_ERR_INVALID_ARG;
         }
         strlcpy(name, value, name_len);
@@ -388,7 +396,7 @@ static esp_err_t put_music_handler(httpd_req_t *req)
 
     ESP_LOGI(s_tag, "Upload concluido: %s (%u bytes)", name, (unsigned)total_received);
 
-    char response[160];
+    char response[MUSIC_MAX_NAME_LEN + 64];
     snprintf(response, sizeof(response), "{\"ok\":true,\"nome\":\"%s\",\"bytes\":%u}", name, (unsigned)total_received);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, response);
@@ -775,7 +783,7 @@ static esp_err_t delete_music_handler(httpd_req_t *req)
         return send_error_json(req, 500, "falha ao remover musica");
     }
 
-    char response[128];
+    char response[MUSIC_MAX_NAME_LEN + 32];
     snprintf(response, sizeof(response), "{\"ok\":true,\"nome\":\"%s\"}", name);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, response);
@@ -808,7 +816,7 @@ static esp_err_t start_http_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
     config.max_uri_handlers = 16;
-    config.recv_wait_timeout = 10; // Aumente o timeout
+    config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
     config.lru_purge_enable = true;
 
