@@ -34,7 +34,8 @@ Este firmware:
 - `ESP32`
 - Cartão `microSD`
 - Módulo/leitor SD em modo `SPI`
-- Caixa de som, fone ou TWS com `Bluetooth A2DP`
+- Display TFT em modo `SPI`
+- Caixa de som, ou fone com `Bluetooth A2DP`
 - 1 botão ligado ao pino de power/wakeup
 - LED de status na placa
 
@@ -42,10 +43,22 @@ Este firmware:
 
 Configuração definida em [`main/main.c`](/home/ferreira/Público/projetos/MusicPlayer/main/main.c):
 
+### Módulo SD
 - `MISO`: GPIO `19`
 - `MOSI`: GPIO `23`
 - `CLK`: GPIO `18`
 - `CS`: GPIO `4`
+
+### Display TFT
+- `MISO`: GPIO `19`
+- `MOSI`: GPIO `23`
+- `SCK`: GPIO `18`
+- `DC`: GPIO ``
+- `LED`: `3.3V`
+- `RESET`: GPIO `32`
+- `CS`: GPIO `21`
+
+### Outros
 - `POWER / WAKE`: GPIO `33`
 - `LED`: GPIO `2`
 
@@ -53,9 +66,10 @@ Configuração definida em [`main/main.c`](/home/ferreira/Público/projetos/Musi
 
 O controle é feito pelo botão conectado ao GPIO `33`:
 
-- Segurar por aproximadamente `2s`: entra em `deep sleep`
+- Segurar por aproximadamente `3s`: entra em `deep sleep`
 - Clique duplo: aumenta o volume
 - Clique triplo: diminui o volume
+- Clique 5 vezes: Entra no modo `WI-FI` (Modo AP para configurar o Software)
 
 ## Fluxo de funcionamento
 
@@ -140,8 +154,7 @@ As opções ficam no menu `MusicPlayer Configuration`.
 - A próxima faixa é escolhida de forma aleatória
 - O projeto depende de um dispositivo Bluetooth alvo configurado no `menuconfig`
 - A compatibilidade de amostragem é validada para `44.1 kHz` e `48 kHz`
-- O auto-sleep ocorre após aproximadamente `1 minuto` sem Bluetooth/áudio
-- Não há interface gráfica, display ou menu local
+- Não há interface gráfica, display ou menu local (Por hora)
 
 ## Arquivos importantes
 
@@ -165,8 +178,6 @@ As opções ficam no menu `MusicPlayer Configuration`.
 ## Status
 
 Projeto funcional e pronto para testes em hardware real.
-
-Se for publicar no GitHub, Reddit e LinkedIn, adicionar fotos do protótipo, esquema de ligação e um pequeno vídeo do sistema tocando música vai aumentar bastante a credibilidade do projeto.
 
 ## Licença
 
