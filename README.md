@@ -46,17 +46,17 @@ Configuração definida em [`main/main.c`](/home/ferreira/Público/projetos/Musi
 ### Módulo SD
 - `MISO`: GPIO `19`
 - `MOSI`: GPIO `23`
-- `CLK`: GPIO `18`
+- `CLK/SCK`: GPIO `18`
 - `CS`: GPIO `4`
 
 ### Display TFT
 - `MISO`: GPIO `19`
 - `MOSI`: GPIO `23`
-- `SCK`: GPIO `18`
-- `DC`: GPIO ``
-- `LED`: `3.3V`
+- `SCk/CLK`: GPIO `18`
 - `RESET`: GPIO `32`
+- `DC`: GPIO `22`
 - `CS`: GPIO `21`
+- `LED`: `3.3V`
 
 ### Outros
 - `POWER / WAKE`: GPIO `33`
