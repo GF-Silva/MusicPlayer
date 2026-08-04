@@ -892,7 +892,7 @@
           renderQueue();
           try {
             const res = await fetch(`/musics?nome=${encodeURIComponent(item.file.name)}`, {
-              method: 'PUT',
+              method: 'POST',
               headers: { 'Content-Type': item.file.type || 'audio/mpeg' },
               body: item.file,
             });

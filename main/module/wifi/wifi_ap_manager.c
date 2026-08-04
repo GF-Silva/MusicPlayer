@@ -22,7 +22,7 @@
 #include "cJSON.h"
 #include "system_config_manager.h"
 
-#define MUSIC_UPLOAD_CHUNK_SIZE 1024
+#define MUSIC_UPLOAD_CHUNK_SIZE 32768
 #define MUSIC_MAX_NAME_LEN 176
 #define MUSIC_MAX_PATH_LEN 192
 #define MUSIC_QUERY_VALUE_LEN 512
@@ -395,7 +395,7 @@ static esp_err_t update_configs_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
-static esp_err_t put_music_handler(httpd_req_t *req)
+static esp_err_t post_music_handler(httpd_req_t *req)
 {
     char name[MUSIC_MAX_NAME_LEN + 1] = {0};
     char path[MUSIC_MAX_PATH_LEN];
@@ -432,7 +432,7 @@ static esp_err_t put_music_handler(httpd_req_t *req)
         return send_error_json(req, 500, "falha ao abrir arquivo no SD");
     }
 
-    ESP_LOGI(s_tag, "Recebendo upload PUT: %s", name);
+    ESP_LOGI(s_tag, "Recebendo upload POST: %s", name);
 
     while (true) {
         int ret = httpd_req_recv(req, buffer, sizeof(buffer));
@@ -939,15 +939,10 @@ static esp_err_t start_http_server(void)
         .method = HTTP_GET,
         .handler = get_errors_handler,
     };
-    const httpd_uri_t put_musics = {
-        .uri = "/put-musics",
-        .method = HTTP_PUT,
-        .handler = put_music_handler,
-    };
-    const httpd_uri_t put_music = {
+    const httpd_uri_t post_musics = {
         .uri = "/musics",
-        .method = HTTP_PUT,
-        .handler = put_music_handler,
+        .method = HTTP_POST,
+        .handler = post_music_handler,
     };
     const httpd_uri_t get_musics = {
         .uri = "/musics",
@@ -971,8 +966,7 @@ static esp_err_t start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &put_configs));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &patch_configs));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &get_errors));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &put_musics));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &put_music));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &post_musics));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &get_musics));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &delete_music));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream));
