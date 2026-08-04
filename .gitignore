@@ -59,3 +59,6 @@ __pycache__/
 
 # User-specific ESP-IDF local config
 /esp_idf_project_configuration.json
+
+# Testes directory
+testes/

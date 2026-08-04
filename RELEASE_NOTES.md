@@ -135,7 +135,7 @@ idf.py -p /dev/YOUR_PORT flash monitor
 ```
 
 ### Quick Start
-1. **Prepare Files:** Add MP3 files to the root of your microSD card
+1. **Prepare Files:** Add MP3 files to the configured music directory on your microSD card
 2. **Configure:** Use `idf.py menuconfig` to set:
    - Bluetooth target device MAC address
    - WiFi SSID and password (optional)
@@ -192,7 +192,7 @@ Access via `idf.py menuconfig` → `MusicPlayer Configuration`:
 
 ## 🐛 Known Limitations
 
-- MP3 files limited to root directory of microSD
+- MP3 files limited to the configured music directory
 - Random track selection (next/previous not implemented yet)
 - WiFi streaming requires network configuration
 - No folder hierarchies in library view

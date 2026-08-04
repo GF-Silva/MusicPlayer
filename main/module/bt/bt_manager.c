@@ -98,7 +98,9 @@ esp_err_t bt_manager_search_and_connect(bt_manager_t *mgr)
         return ESP_OK;
     }
 
-    ESP_LOGI(mgr->tag, "Iniciando busca Bluetooth...");
+    ESP_LOGI(mgr->tag,
+             "Iniciando busca Bluetooth (%s)...",
+             mgr->target_device_name && mgr->target_device_name[0] ? mgr->target_device_name : "sem nome alvo");
 
     *mgr->device_found = false;
     *mgr->connect_after_discovery_stop = false;

@@ -568,6 +568,16 @@ void playback_engine_start_current_track(void)
         return;
     }
 
+    if (*s_ctx->mp3_count <= 0) {
+        ESP_LOGW(s_ctx->tag, "Playback ignorado: nenhum MP3 encontrado (IDLE)");
+        s_ctx->stop_playback_and_reset(true, "no_tracks");
+        return;
+    }
+
+    if (*s_ctx->current_track >= *s_ctx->mp3_count) {
+        *s_ctx->current_track = 0;
+    }
+
     s_ctx->stop_playback_and_reset(true, "start_track");
 
     *s_ctx->total_bytes_streamed = 0;

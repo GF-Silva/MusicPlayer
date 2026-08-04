@@ -35,8 +35,10 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 
 static const char *s_tag = "wifi_ap";
-static const char *s_mount_point = "/sdcard";
+static const char *s_sd_mount_point = "/sdcard";
+static const char *s_music_mount_point = "/sdcard";
 static httpd_handle_t s_http_server;
+static bool s_error_log_available = true;
 
 typedef struct {
     char author[MUSIC_AUTHOR_LEN];
@@ -155,12 +157,39 @@ static esp_err_t make_music_path(const char *name, char *path, size_t path_len)
         return ESP_ERR_INVALID_ARG;
     }
 
-    int written = snprintf(path, path_len, "%s/%s", s_mount_point, name);
+    int written = snprintf(path, path_len, "%s/%s", s_music_mount_point, name);
     if (written < 0 || written >= (int)path_len) {
         return ESP_ERR_NO_MEM;
     }
 
     return ESP_OK;
+}
+
+static esp_err_t regular_file_exists_at_path(const char *path, bool *exists)
+{
+    struct stat st;
+
+    if (!path || !exists) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *exists = false;
+    if (stat(path, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) {
+            ESP_LOGE(s_tag, "Caminho existe, mas nao e arquivo regular: %s", path);
+            return ESP_FAIL;
+        }
+        *exists = true;
+        return ESP_OK;
+    }
+
+    int stat_errno = errno;
+    if (stat_errno == ENOENT) {
+        return ESP_OK;
+    }
+
+    ESP_LOGE(s_tag, "Falha acessando %s: errno=%d", path, stat_errno);
+    return ESP_FAIL;
 }
 
 static esp_err_t get_music_name_from_request(httpd_req_t *req, char *name, size_t name_len, bool allow_body)
@@ -229,17 +258,38 @@ static esp_err_t get_music_name_from_request(httpd_req_t *req, char *name, size_
 
 static esp_err_t send_error_json(httpd_req_t *req, int status, const char *message)
 {
-    char response[96];
+    const char *safe_message = message ? message : "erro";
 
-    system_config_append_error(s_mount_point, s_tag, message);
-    snprintf(response, sizeof(response), "{\"erro\":\"%s\"}", message);
+    if (status >= 500 && s_error_log_available) {
+        esp_err_t log_ret = system_config_append_error(s_sd_mount_point, s_tag, safe_message);
+        if (log_ret != ESP_OK) {
+            s_error_log_available = false;
+            ESP_LOGW(s_tag, "Log de erros no SD desativado nesta sessao: %s", esp_err_to_name(log_ret));
+        }
+    }
     httpd_resp_set_status(req, status == 400 ? "400 Bad Request" :
                                status == 404 ? "404 Not Found" :
                                status == 409 ? "409 Conflict" :
+                               status == 422 ? "422 Unprocessable Entity" :
                                status == 500 ? "500 Internal Server Error" :
                                                "400 Bad Request");
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, response);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return httpd_resp_sendstr(req, "{\"erro\":\"falha ao montar erro\"}");
+    }
+
+    cJSON_AddStringToObject(root, "erro", safe_message);
+    char *response = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!response) {
+        return httpd_resp_sendstr(req, "{\"erro\":\"falha ao montar erro\"}");
+    }
+
+    esp_err_t ret = httpd_resp_sendstr(req, response);
+    cJSON_free(response);
+    return ret;
 }
 
 static esp_err_t stream_system_file(httpd_req_t *req, const char *file_name, const char *content_type)
@@ -247,7 +297,7 @@ static esp_err_t stream_system_file(httpd_req_t *req, const char *file_name, con
     char path[MUSIC_MAX_PATH_LEN];
     char buffer[WIFI_FILE_STREAM_CHUNK_SIZE];
 
-    esp_err_t ret = system_config_build_path(s_mount_point, file_name, path, sizeof(path));
+    esp_err_t ret = system_config_build_path(s_sd_mount_point, file_name, path, sizeof(path));
     if (ret != ESP_OK) {
         return send_error_json(req, 500, "falha montando caminho do sistema");
     }
@@ -317,11 +367,25 @@ static esp_err_t update_configs_handler(httpd_req_t *req)
         received += (size_t)ret;
     }
 
-    esp_err_t ret = system_config_replace_json(s_mount_point, body, received, s_tag);
+    char validation_error[160];
+    system_config_json_status_t validation = system_config_validate_json(body,
+                                                                         received,
+                                                                         validation_error,
+                                                                         sizeof(validation_error));
+    if (validation != SYSTEM_CONFIG_JSON_OK) {
+        int status = validation == SYSTEM_CONFIG_JSON_MALFORMED ? 400 :
+                     validation == SYSTEM_CONFIG_JSON_NO_MEM ? 500 :
+                                                             422;
+        const char *message = validation_error[0] ? validation_error : "arquivo de config invalido";
+        free(body);
+        return send_error_json(req, status, message);
+    }
+
+    esp_err_t ret = system_config_replace_json(s_sd_mount_point, body, received, s_tag);
     free(body);
 
     if (ret == ESP_ERR_INVALID_ARG) {
-        return send_error_json(req, 400, "json de config invalido");
+        return send_error_json(req, 422, "arquivo de config invalido");
     }
     if (ret != ESP_OK) {
         return send_error_json(req, 500, "falha salvando config");
@@ -350,6 +414,16 @@ static esp_err_t put_music_handler(httpd_req_t *req)
     int written = snprintf(temp_path, sizeof(temp_path), "%s.part", path);
     if (written < 0 || written >= (int)sizeof(temp_path)) {
         return send_error_json(req, 400, "caminho muito longo");
+    }
+
+    bool target_exists = false;
+    err = regular_file_exists_at_path(path, &target_exists);
+    if (err != ESP_OK) {
+        return send_error_json(req, 500, "falha ao verificar arquivo no SD");
+    }
+    if (target_exists) {
+        ESP_LOGW(s_tag, "Upload ignorado, arquivo ja existe: %s", path);
+        return send_error_json(req, 409, "musica ja existe");
     }
 
     FILE *file = fopen(temp_path, "wb");
@@ -387,7 +461,17 @@ static esp_err_t put_music_handler(httpd_req_t *req)
         return send_error_json(req, 500, "falha ao finalizar arquivo");
     }
 
-    remove(path);
+    err = regular_file_exists_at_path(path, &target_exists);
+    if (err != ESP_OK) {
+        remove(temp_path);
+        return send_error_json(req, 500, "falha ao verificar arquivo no SD");
+    }
+    if (target_exists) {
+        ESP_LOGW(s_tag, "Upload cancelado, arquivo surgiu durante envio: %s", path);
+        remove(temp_path);
+        return send_error_json(req, 409, "musica ja existe");
+    }
+
     if (rename(temp_path, path) != 0) {
         ESP_LOGE(s_tag, "Falha renomeando %s para %s: errno=%d", temp_path, path, errno);
         remove(temp_path);
@@ -729,7 +813,7 @@ static esp_err_t send_music_item(httpd_req_t *req, const char *name, bool first)
 
 static esp_err_t get_musics_handler(httpd_req_t *req)
 {
-    DIR *dir = opendir(s_mount_point);
+    DIR *dir = opendir(s_music_mount_point);
     if (!dir) {
         return send_error_json(req, 500, "falha ao abrir SD");
     }
@@ -898,14 +982,18 @@ static esp_err_t start_http_server(void)
 
 esp_err_t wifi_ap_manager_start(const wifi_ap_manager_cfg_t *cfg)
 {
-    if (!cfg || !cfg->ssid || cfg->ssid[0] == '\0' || !cfg->mount_point || cfg->mount_point[0] == '\0') {
+    if (!cfg || !cfg->ssid || cfg->ssid[0] == '\0' ||
+        !cfg->sd_mount_point || cfg->sd_mount_point[0] == '\0' ||
+        !cfg->music_mount_point || cfg->music_mount_point[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
     if (cfg->tag) {
         s_tag = cfg->tag;
     }
-    s_mount_point = cfg->mount_point;
+    s_sd_mount_point = cfg->sd_mount_point;
+    s_music_mount_point = cfg->music_mount_point;
+    s_error_log_available = true;
 
     esp_err_t ret = esp_netif_init();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {

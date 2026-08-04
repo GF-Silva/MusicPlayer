@@ -29,6 +29,7 @@ typedef struct {
 
     esp_bd_addr_t *target_device_addr;
     const esp_bd_addr_t *target_mac_addr;
+    const char *target_device_name;
 
     EventGroupHandle_t *player_event_group;
     EventBits_t bt_connected_bit;

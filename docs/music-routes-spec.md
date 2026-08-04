@@ -8,7 +8,7 @@ As rotas de musica devem operar com baixo uso de RAM no ESP32:
 - listagem das musicas em JSON, enviada em chunks;
 - remocao de uma musica por vez.
 
-Todas as rotas operam somente sobre arquivos `.mp3` na raiz do cartao SD montado em `CONFIG_MUSICPLAYER_MOUNT_POINT`.
+Todas as rotas operam somente sobre arquivos `.mp3` no diretorio efetivo de musicas definido por `storage.mount_point` em `/.system/config.json`. Quando esse valor e relativo, ele e resolvido dentro de `storage.sd_mount_point`; no config default, isso resulta em `/sdcard/musics`.
 
 ## Regras de Nome
 
