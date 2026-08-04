@@ -435,6 +435,74 @@
       /* ── DIVIDER ── */
       .divider { height: 1px; background: var(--border); margin: 12px 0; }
 
+      /* ── CONFIG OVERLAY ── */
+      .config-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        background: rgba(8,10,16,0.76);
+        backdrop-filter: blur(10px);
+      }
+      .config-overlay[hidden] { display: none; }
+      .config-dialog {
+        width: min(420px, 100%);
+        min-height: 168px;
+        display: grid;
+        gap: 12px;
+        align-content: center;
+        justify-items: center;
+        position: relative;
+        padding: 26px 22px 22px;
+        border: 1px solid var(--border-hover);
+        border-radius: var(--r-lg);
+        background: var(--bg2);
+        box-shadow: 0 18px 60px rgba(0,0,0,0.42);
+        text-align: center;
+      }
+      .overlay-close {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        width: 30px;
+        height: 30px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg3);
+        color: var(--text2);
+        cursor: pointer;
+        font-weight: 700;
+        line-height: 1;
+      }
+      .overlay-close:hover { color: var(--text); border-color: var(--border-hover); }
+      .overlay-close[hidden] { display: none; }
+      .overlay-spinner {
+        width: 34px;
+        height: 34px;
+        border: 3px solid var(--border-hover);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.75s linear infinite;
+      }
+      .config-overlay.error .overlay-spinner,
+      .config-overlay.success .overlay-spinner { display: none; }
+      .config-overlay.success .config-dialog { border-color: rgba(61,214,140,0.35); }
+      .config-overlay.error .config-dialog { border-color: rgba(248,113,113,0.35); }
+      .overlay-title { font-weight: 700; font-size: 0.98rem; }
+      .overlay-message {
+        max-width: 100%;
+        color: var(--text2);
+        font-size: 0.82rem;
+        overflow-wrap: anywhere;
+      }
+      .config-overlay.success .overlay-title { color: var(--ok); }
+      .config-overlay.error .overlay-title { color: var(--fail); }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
       /* ── RESPONSIVE ── */
       @media (max-width: 780px) {
         .route-panel { grid-template-columns: 1fr 1fr; }
@@ -600,6 +668,15 @@
       </main>
     </div>
 
+    <div id="config-overlay" class="config-overlay" hidden aria-live="polite" role="status">
+      <div class="config-dialog">
+        <button id="config-overlay-close" class="overlay-close" type="button" hidden>X</button>
+        <div id="config-overlay-spinner" class="overlay-spinner"></div>
+        <div id="config-overlay-title" class="overlay-title">Enviando config</div>
+        <div id="config-overlay-message" class="overlay-message">Validando e salvando arquivo...</div>
+      </div>
+    </div>
+
     <script>
       const state = {
         musics: [],
@@ -621,10 +698,44 @@
       const musicCountEl = $id('music-count');
       const selectedCountEl = $id('selected-count');
       const queueCountEl = $id('queue-count');
+      const configOverlayEl = $id('config-overlay');
+      const configOverlayCloseEl = $id('config-overlay-close');
+      const configOverlayTitleEl = $id('config-overlay-title');
+      const configOverlayMessageEl = $id('config-overlay-message');
 
       function setStatus(text, kind = '') {
         statusEl.textContent = text;
         statusEl.className = 'status-pill ' + kind;
+      }
+
+      function showConfigOverlay(kind, title, message, canClose = false) {
+        configOverlayEl.hidden = false;
+        configOverlayEl.className = 'config-overlay ' + kind;
+        configOverlayEl.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+        configOverlayTitleEl.textContent = title;
+        configOverlayMessageEl.textContent = message;
+        configOverlayCloseEl.hidden = !canClose;
+      }
+
+      function hideConfigOverlay() {
+        configOverlayEl.hidden = true;
+        configOverlayEl.className = 'config-overlay';
+        configOverlayCloseEl.hidden = true;
+      }
+
+      function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+      }
+
+      async function readErrorMessage(res) {
+        const text = await res.text();
+        if (!text) return `erro HTTP ${res.status}`;
+        try {
+          const data = JSON.parse(text);
+          return data.erro || data.error || text;
+        } catch {
+          return text;
+        }
       }
 
       function updateNavigation() {
@@ -836,17 +947,48 @@
       }
 
       async function saveConfig() {
-        setStatus('Salvando…');
+        if (state.busy) return;
+
+        let parsed;
         try {
-          const parsed = JSON.parse(configEditorEl.value);
+          parsed = JSON.parse(configEditorEl.value);
+        } catch (err) {
+          setStatus('JSON inválido', 'fail');
+          showConfigOverlay('error', 'Arquivo inválido', `Formatação JSON inválida: ${err.message}`, true);
+          return;
+        }
+
+        state.busy = true;
+        setStatus('Enviando config…');
+        showConfigOverlay('loading', 'Enviando config', 'Validando e salvando arquivo...');
+        try {
           const res = await fetch('/configs', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(parsed),
           });
-          if (!res.ok) throw new Error(await res.text());
-          setStatus('Config salva', 'ok');
-        } catch { setStatus('JSON inválido ou falha ao salvar', 'fail'); }
+          if (!res.ok) {
+            const err = new Error(await readErrorMessage(res));
+            err.status = res.status;
+            throw err;
+          }
+          setStatus('Config enviada', 'ok');
+          showConfigOverlay('success', 'Config enviada', 'Arquivo salvo com sucesso.');
+          await delay(750);
+          hideConfigOverlay();
+        } catch (err) {
+          const invalidConfig = err && (err.status === 400 || err.status === 422);
+          const message = err && err.message ? err.message : 'Falha ao salvar config.';
+          setStatus(invalidConfig ? 'Arquivo de config inválido' : 'Falha ao salvar config', 'fail');
+          showConfigOverlay(
+            'error',
+            invalidConfig ? 'Arquivo inválido' : 'Falha ao salvar',
+            message,
+            true
+          );
+        } finally {
+          state.busy = false;
+        }
       }
 
       async function loadErrors() {
@@ -872,6 +1014,7 @@
       $id('reload-config').addEventListener('click', loadConfig);
       $id('save-config').addEventListener('click', saveConfig);
       $id('reload-errors').addEventListener('click', loadErrors);
+      configOverlayCloseEl.addEventListener('click', hideConfigOverlay);
 
       fileInputEl.addEventListener('change', () => {
         state.uploadQueue = Array.from(fileInputEl.files || []).map(file => ({
