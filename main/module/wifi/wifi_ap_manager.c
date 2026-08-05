@@ -21,8 +21,10 @@
 #include "sdkconfig.h"
 #include "cJSON.h"
 #include "system_config_manager.h"
+#include "esp_timer.h"
 
-#define MUSIC_UPLOAD_CHUNK_SIZE 32768
+#define MUSIC_UPLOAD_CHUNK_SIZE 4096
+#define MUSIC_UPLOAD_METRICS_INTERVAL_US (3 * 1000 * 1000)
 #define MUSIC_MAX_NAME_LEN 176
 #define MUSIC_MAX_PATH_LEN 192
 #define MUSIC_QUERY_VALUE_LEN 512
@@ -33,6 +35,8 @@
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[] asm("_binary_index_html_end");
+
+static uint8_t s_upload_buffer[MUSIC_UPLOAD_CHUNK_SIZE];
 
 static const char *s_tag = "wifi_ap";
 static const char *s_sd_mount_point = "/sdcard";
@@ -400,7 +404,6 @@ static esp_err_t post_music_handler(httpd_req_t *req)
     char name[MUSIC_MAX_NAME_LEN + 1] = {0};
     char path[MUSIC_MAX_PATH_LEN];
     char temp_path[MUSIC_MAX_PATH_LEN + 8];
-    char buffer[MUSIC_UPLOAD_CHUNK_SIZE];
     size_t total_received = 0;
 
     esp_err_t err = get_music_name_from_request(req, name, sizeof(name), false);
@@ -432,10 +435,24 @@ static esp_err_t post_music_handler(httpd_req_t *req)
         return send_error_json(req, 500, "falha ao abrir arquivo no SD");
     }
 
+    // Buffer interno da libc do mesmo tamanho do chunk de rede,
+    // evita que o fwrite quebre a escrita em pedacos menores.
+    static char s_stdio_buf[MUSIC_UPLOAD_CHUNK_SIZE];
+    setvbuf(file, s_stdio_buf, _IOFBF, sizeof(s_stdio_buf));
+
     ESP_LOGI(s_tag, "Recebendo upload POST: %s", name);
 
+    int64_t upload_start_us = esp_timer_get_time();
+    int64_t window_start_us = upload_start_us;
+    int64_t recv_time_accum_us = 0;
+    int64_t write_time_accum_us = 0;
+    size_t bytes_since_window = 0;
+
     while (true) {
-        int ret = httpd_req_recv(req, buffer, sizeof(buffer));
+        int64_t recv_t0 = esp_timer_get_time();
+        int ret = httpd_req_recv(req, (char *)s_upload_buffer, sizeof(s_upload_buffer));
+        int64_t recv_t1 = esp_timer_get_time();
+
         if (ret <= 0) {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
                 continue;
@@ -443,14 +460,44 @@ static esp_err_t post_music_handler(httpd_req_t *req)
             break;
         }
 
-        if (fwrite(buffer, 1, (size_t)ret, file) != (size_t)ret) {
+        recv_time_accum_us += (recv_t1 - recv_t0);
+
+        int64_t write_t0 = esp_timer_get_time();
+        size_t wrote = fwrite(s_upload_buffer, 1, (size_t)ret, file);
+        int64_t write_t1 = esp_timer_get_time();
+
+        if (wrote != (size_t)ret) {
             ESP_LOGE(s_tag, "Falha escrevendo %s: errno=%d", temp_path, errno);
             fclose(file);
             remove(temp_path);
             return send_error_json(req, 500, "falha ao gravar arquivo no SD");
         }
 
+        write_time_accum_us += (write_t1 - write_t0);
+
         total_received += (size_t)ret;
+        bytes_since_window += (size_t)ret;
+
+        // Imprime metricas periodicamente, sem esperar o upload terminar.
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - window_start_us >= MUSIC_UPLOAD_METRICS_INTERVAL_US) {
+            double wifi_mb_s = recv_time_accum_us > 0
+                ? (bytes_since_window / (1024.0 * 1024.0)) / (recv_time_accum_us / 1e6)
+                : 0.0;
+            double sd_mb_s = write_time_accum_us > 0
+                ? (bytes_since_window / (1024.0 * 1024.0)) / (write_time_accum_us / 1e6)
+                : 0.0;
+
+            ESP_LOGI(s_tag,
+                     "[upload %s] wifi=%.2f MB/s | sd=%.2f MB/s | recebido=%u KB",
+                     name, wifi_mb_s, sd_mb_s, (unsigned)(total_received / 1024));
+
+            window_start_us = now_us;
+            recv_time_accum_us = 0;
+            write_time_accum_us = 0;
+            bytes_since_window = 0;
+        }
+
         if (req->content_len > 0 && total_received >= req->content_len) {
             break;
         }
@@ -478,7 +525,15 @@ static esp_err_t post_music_handler(httpd_req_t *req)
         return send_error_json(req, 500, "falha ao confirmar upload");
     }
 
-    ESP_LOGI(s_tag, "Upload concluido: %s (%u bytes)", name, (unsigned)total_received);
+    int64_t upload_end_us = esp_timer_get_time();
+    double total_ms = (upload_end_us - upload_start_us) / 1000.0;
+    double overall_mb_s = total_ms > 0
+        ? (total_received / (1024.0 * 1024.0)) / (total_ms / 1000.0)
+        : 0.0;
+
+    ESP_LOGI(s_tag,
+             "Upload concluido: %s (%u bytes) em %.0f ms (%.2f MB/s medio)",
+             name, (unsigned)total_received, total_ms, overall_mb_s);
 
     char response[MUSIC_MAX_NAME_LEN + 64];
     snprintf(response, sizeof(response), "{\"ok\":true,\"nome\":\"%s\",\"bytes\":%u}", name, (unsigned)total_received);
@@ -898,7 +953,7 @@ static esp_err_t start_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192;
+    config.stack_size = 12288;
     config.max_uri_handlers = 16;
     config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
@@ -1039,7 +1094,9 @@ esp_err_t wifi_ap_manager_start(const wifi_ap_manager_cfg_t *cfg)
         ESP_LOGE(s_tag, "Falha esp_wifi_start: %s", esp_err_to_name(ret));
         return ret;
     }
-    esp_wifi_set_max_tx_power(84);
+
+    // TODO: Fazer isso ser configuravel nas configs
+    esp_wifi_set_max_tx_power(52);
 
     ESP_LOGI(s_tag, "WiFi AP ativo: SSID=%s, canal=%u, IP=http://192.168.4.1/",
              cfg->ssid,
