@@ -49,24 +49,15 @@ Configuração definida em [`main/main.c`](/home/ferreira/Público/projetos/Musi
 - `CLK/SCK`: GPIO `18`
 - `CS`: GPIO `4`
 
-### Display TFT
-- `MISO`: GPIO `19`
-- `MOSI`: GPIO `23`
-- `SCk/CLK`: GPIO `18`
-- `RESET`: GPIO `32`
-- `DC`: GPIO `22`
-- `CS`: GPIO `21`
-- `LED`: `3.3V`
-
 ### Outros
-- `POWER / WAKE`: GPIO `33`
+- `POWER / WAKE`: GPIO `33` + GND
 - `LED`: GPIO `2`
 
 ## Controles
 
 O controle é feito pelo botão conectado ao GPIO `33`:
 
-- Segurar por aproximadamente `3s`: entra em `deep sleep`
+- Segurar por aproximadamente `5s`: entra em `deep sleep`
 - Clique duplo: aumenta o volume
 - Clique triplo: diminui o volume
 - Clique 5 vezes: Entra no modo `WI-FI` (Modo AP para configurar o Software)
