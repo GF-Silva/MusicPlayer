@@ -48,4 +48,5 @@ idf_component_register(
         esp-libhelix-mp3
         cjson
         esp_adc
+        esp_timer
 )

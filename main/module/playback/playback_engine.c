@@ -255,6 +255,7 @@ void playback_engine_decode_task(void *pvParameter)
         }
     }
 
+    ESP_LOGI(s_ctx->tag, "   Heap livre: %lu bytes", (unsigned long)esp_get_free_heap_size());
     ESP_LOGI(s_ctx->tag, "✅ Pré-buffer pronto (%d frames)", frame_count);
 
     while (*s_ctx->file_reader_task_running) {
