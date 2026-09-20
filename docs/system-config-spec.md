@@ -23,7 +23,7 @@ Depois que o SD monta, o firmware garante que `.system` exista.
 Se `config.json` nao existir, ele cria um JSON default com:
 
 - dispositivo BT: `TWS`;
-- mount point logico de musicas: `musics`;
+- diretorio de musicas: `musics`;
 - mount point fisico do SD: valor de `CONFIG_MUSICPLAYER_MOUNT_POINT`;
 - valores atuais consumidos pelo firmware em Wi-Fi, audio, Bluetooth e runtime.
 
@@ -44,8 +44,7 @@ Formato default:
   },
   "storage": {
     "sd_mount_point": "/sdcard",
-    "mount_point": "musics",
-    "system_dir": ".system"
+    "mount_point": "musics"
   },
   "wifi": {
     "ssid": "ESP32-MusicPlayer",
@@ -69,7 +68,9 @@ Formato default:
 }
 ```
 
-Nesta etapa, o arquivo e criado, lido e editado no modo Wi-Fi. A aplicacao ainda usa os defaults compilados para os subsistemas ja inicializados; aplicar configs dinamicas aos modulos de audio/Bluetooth fica isolado para uma etapa posterior.
+O diretório `.system` e reservado pelo firmware para os arquivos internos e nao faz parte da configuracao editavel. O campo `storage.mount_point` define onde as musicas ficam: se for relativo, ele e resolvido dentro de `storage.sd_mount_point`; se for absoluto, e usado diretamente.
+
+Depois de reiniciar, o firmware consome os valores do arquivo para Wi-Fi AP, Bluetooth, volume, buffers de audio, timeouts de runtime e diretorio de musicas.
 
 ## GET /get-configs
 
@@ -82,21 +83,21 @@ Accept: application/json
 
 Resposta:
 
-```json
-{
-  "schema": "musicplayer.config.v1"
-}
-```
+Retorna o JSON completo no formato descrito em `Config JSON`.
 
 ## PUT /configs
 
-Substitui o arquivo de config por um JSON valido.
+Substitui o arquivo de config por um JSON valido. A rota valida o arquivo antes de gravar:
+
+- `400 Bad Request`: JSON ausente, grande demais ou com formatacao incorreta;
+- `422 Unprocessable Entity`: JSON bem formado, mas com schema, estrutura, campo ausente, tipo ou valor de config invalido;
+- `500 Internal Server Error`: falha interna ao receber ou salvar.
 
 ```http
 PUT /configs
 Content-Type: application/json
 
-{"schema":"musicplayer.config.v1"}
+{ ...config JSON completo... }
 ```
 
 Resposta:

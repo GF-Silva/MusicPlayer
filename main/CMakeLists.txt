@@ -47,4 +47,6 @@ idf_component_register(
         sdmmc
         esp-libhelix-mp3
         cjson
+        esp_adc
+        esp_timer
 )

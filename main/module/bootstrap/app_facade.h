@@ -36,6 +36,7 @@ typedef struct {
 
     esp_bd_addr_t *target_device_addr;
     esp_bd_addr_t *target_mac_addr;
+    const char *target_device_name;
 
     TickType_t *bt_connecting_since;
 

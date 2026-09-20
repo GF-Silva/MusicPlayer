@@ -9,7 +9,7 @@ O projeto foi organizado em módulos para separar bootstrap, Bluetooth, pipeline
 Este firmware:
 
 - monta o cartão `microSD` via `SDSPI`
-- procura arquivos `.mp3` na raiz do cartão
+- procura arquivos `.mp3` no diretório configurado em `/.system/config.json`
 - busca um dispositivo Bluetooth alvo por `MAC address`
 - conecta como `A2DP Source`
 - decodifica os frames MP3 com `esp-libhelix-mp3`
@@ -66,11 +66,12 @@ O controle é feito pelo botão conectado ao GPIO `33`:
 
 1. O sistema inicia e configura wakeup/LED.
 2. O cartão SD é montado em `/sdcard`.
-3. Os arquivos `.mp3` da raiz do cartão são contados.
-4. Os buffers de áudio e o decoder são preparados.
-5. O ESP32 procura o dispositivo Bluetooth alvo.
-6. Ao conectar, o stream A2DP é iniciado.
-7. As músicas são tocadas e, ao terminar, a próxima faixa é escolhida de forma aleatória.
+3. O arquivo `/.system/config.json` é carregado e define o diretório de músicas.
+4. Os arquivos `.mp3` do diretório configurado são contados.
+5. Os buffers de áudio e o decoder são preparados.
+6. O ESP32 procura o dispositivo Bluetooth alvo.
+7. Ao conectar, o stream A2DP é iniciado.
+8. As músicas são tocadas e, ao terminar, a próxima faixa é escolhida de forma aleatória.
 
 ## Estrutura do projeto
 
@@ -109,7 +110,7 @@ idf.py -p /dev/SEU_PORTA flash monitor
 
 ## Como usar
 
-1. Coloque arquivos `.mp3` na raiz do cartão `microSD`.
+1. Coloque arquivos `.mp3` no diretório configurado em `storage.mount_point` no cartão `microSD` (`/sdcard/musics` no config default).
 2. Ajuste no `idf.py menuconfig` o `MAC` do dispositivo Bluetooth alvo.
 3. Grave o firmware no `ESP32`.
 4. Ligue o dispositivo.
@@ -141,7 +142,7 @@ As opções ficam no menu `MusicPlayer Configuration`.
 
 ## Comportamento atual e limitações
 
-- Os arquivos `.mp3` são buscados somente na raiz de `/sdcard`
+- Os arquivos `.mp3` são buscados somente no diretório configurado em `storage.mount_point`
 - A próxima faixa é escolhida de forma aleatória
 - O projeto depende de um dispositivo Bluetooth alvo configurado no `menuconfig`
 - A compatibilidade de amostragem é validada para `44.1 kHz` e `48 kHz`

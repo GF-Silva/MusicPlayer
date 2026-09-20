@@ -66,6 +66,7 @@ typedef struct {
 
     esp_bd_addr_t *target_device_addr;
     esp_bd_addr_t *target_mac_addr;
+    const char *target_device_name;
 
     FILE **current_file;
     mp3_info_t *current_mp3_info;

@@ -112,7 +112,11 @@ void app_facade_log_system_status(void)
     ESP_LOGI(s_ctx->tag, "   Tocando: %s", *s_ctx->audio_playing ? "✅" : "❌");
     ESP_LOGI(s_ctx->tag, "   Stream ativo: %s", *s_ctx->streaming_active ? "✅" : "❌");
     ESP_LOGI(s_ctx->tag, "   MP3s: %d arquivos", *s_ctx->mp3_count);
-    ESP_LOGI(s_ctx->tag, "   Track: [%d/%d]", *s_ctx->current_track + 1, *s_ctx->mp3_count);
+    if (*s_ctx->mp3_count > 0) {
+        ESP_LOGI(s_ctx->tag, "   Track: [%d/%d]", *s_ctx->current_track + 1, *s_ctx->mp3_count);
+    } else {
+        ESP_LOGI(s_ctx->tag, "   Track: IDLE");
+    }
     ESP_LOGI(s_ctx->tag, "   Volume: %u%%", (unsigned)*s_ctx->current_volume);
     ESP_LOGI(s_ctx->tag, "   Heap livre: %lu bytes", (unsigned long)esp_get_free_heap_size());
 
@@ -184,6 +188,7 @@ esp_err_t app_facade_bluetooth_init(void)
     s_ctx->bt_manager->discovery_stop_pending = s_ctx->discovery_stop_pending;
     s_ctx->bt_manager->target_device_addr = s_ctx->target_device_addr;
     s_ctx->bt_manager->target_mac_addr = s_ctx->target_mac_addr;
+    s_ctx->bt_manager->target_device_name = s_ctx->target_device_name;
     s_ctx->bt_manager->discovery_timer = s_ctx->discovery_timer;
     s_ctx->bt_manager->set_bt_connecting = app_facade_set_bt_connecting;
     s_ctx->bt_manager->log_bt_state = app_facade_log_bt_state;

@@ -72,11 +72,11 @@ typedef struct {
 
 static system_status_t sys_status = {0};
 
-static uint8_t current_volume = APP_CONFIG_DEFAULT_VOLUME;
-static float volume_scale = APP_CONFIG_DEFAULT_VOLUME / 100.0f;
+static uint8_t current_volume = 0;
+static float volume_scale = 0.0f;
 
 static esp_bd_addr_t target_device_addr;
-static esp_bd_addr_t target_mac_addr = APP_CONFIG_TARGET_DEVICE_MAC;
+static esp_bd_addr_t target_mac_addr = {0};
 static bool device_found = false;
 static bool discovery_active = false;
 static bool connect_after_discovery_stop = false;
@@ -120,6 +120,9 @@ static bt_callbacks_ctx_t s_bt_callbacks = {0};
 static playback_engine_ctx_t s_playback_engine = {0};
 static a2dp_stream_ctx_t s_a2dp_stream = {0};
 static player_tasks_ctx_t s_player_tasks = {0};
+static system_config_t s_runtime_config = {0};
+static char s_active_sd_mount_point[SYSTEM_CONFIG_MOUNT_POINT_LEN] = APP_CONFIG_MOUNT_POINT;
+static char s_music_root_path[SYSTEM_CONFIG_MOUNT_POINT_LEN * 2] = APP_CONFIG_MOUNT_POINT;
 
 static EventGroupHandle_t player_event_group;
 #define BT_CONNECTED_BIT    BIT0
@@ -165,6 +168,86 @@ static system_config_defaults_t build_system_config_defaults(void)
     return defaults;
 }
 
+static esp_err_t copy_path_checked(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0 || !src || src[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int written = snprintf(dst, dst_len, "%s", src);
+    return (written < 0 || written >= (int)dst_len) ? ESP_ERR_NO_MEM : ESP_OK;
+}
+
+static esp_err_t build_music_root_path(const system_config_t *config, char *path, size_t path_len)
+{
+    if (!config || !path || path_len == 0 || config->sd_mount_point[0] == '\0' ||
+        config->music_mount_point[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *music_mount = config->music_mount_point;
+    if (strcmp(music_mount, ".") == 0 || strcmp(music_mount, "/") == 0) {
+        return copy_path_checked(path, path_len, config->sd_mount_point);
+    }
+
+    if (music_mount[0] == '/') {
+        return copy_path_checked(path, path_len, music_mount);
+    }
+
+    while (music_mount[0] == '.' && music_mount[1] == '/') {
+        music_mount += 2;
+    }
+
+    size_t sd_len = strlen(config->sd_mount_point);
+    const char *sep = (sd_len > 0 && config->sd_mount_point[sd_len - 1] == '/') ? "" : "/";
+    int written = snprintf(path, path_len, "%s%s%s", config->sd_mount_point, sep, music_mount);
+    return (written < 0 || written >= (int)path_len) ? ESP_ERR_NO_MEM : ESP_OK;
+}
+
+static esp_err_t ensure_music_root_exists(const char *path)
+{
+    if (!path || path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
+    }
+
+    if (mkdir(path, 0775) != 0 && errno != EEXIST) {
+        ESP_LOGE(TAG, "Falha criando diretório de músicas %s: errno=%d", path, errno);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static void apply_runtime_config(void)
+{
+    current_volume = s_runtime_config.default_volume;
+    volume_scale = current_volume / 100.0f;
+    memcpy(target_mac_addr, s_runtime_config.target_mac, sizeof(target_mac_addr));
+
+    ESP_LOGI(TAG,
+             "Config efetiva: SD=%s | músicas=%s | BT=%s | volume=%u%%",
+             s_active_sd_mount_point,
+             s_music_root_path,
+             s_runtime_config.bt_device,
+             (unsigned)current_volume);
+}
+
+static esp_err_t load_runtime_config_at_mount(const char *sd_mount_point)
+{
+    system_config_defaults_t defaults = build_system_config_defaults();
+    esp_err_t ret = system_config_ensure(sd_mount_point, &defaults, TAG);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return system_config_load(sd_mount_point, &defaults, &s_runtime_config, TAG);
+}
+
 static void enter_deep_sleep_minimal(bool from_power_button)
 {
     ESP_LOGW(TAG, "Entrando em deep sleep");
@@ -182,29 +265,106 @@ static void enter_deep_sleep_minimal(bool from_power_button)
     esp_deep_sleep_start();
 }
 
+static void signal_sd_mount_failure_and_sleep(void)
+{
+    const gpio_num_t led_gpio = (gpio_num_t)APP_CONFIG_BOARD_LED_GPIO;
+    const bool active_high = APP_CONFIG_BOARD_LED_ACTIVE_HIGH;
+
+    pm_set_power_led(led_gpio, active_high, true);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    pm_set_power_led(led_gpio, active_high, false);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    for (int i = 0; i < 5; i++) {
+        pm_set_power_led(led_gpio, active_high, true);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        pm_set_power_led(led_gpio, active_high, false);
+        if (i < 4) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    pm_hold_led_off_during_sleep(led_gpio, active_high);
+    pm_configure_ext0_wakeup((gpio_num_t)APP_CONFIG_POWER_WAKE_PIN, 0, TAG);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    esp_deep_sleep_start();
+}
+
 static esp_err_t mount_sd_or_restart(void)
 {
+    const char *initial_mount_point = APP_CONFIG_MOUNT_POINT;
     esp_err_t ret = sdcard_manager_mount_sdspi(TAG,
                                                APP_CONFIG_SD_PIN_MOSI,
                                                APP_CONFIG_SD_PIN_MISO,
                                                APP_CONFIG_SD_PIN_CLK,
                                                APP_CONFIG_SD_PIN_CS,
-                                               APP_CONFIG_MOUNT_POINT,
+                                               initial_mount_point,
                                                &sys_status.sd_mounted);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha SD Card: %s", esp_err_to_name(ret));
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        esp_restart();
+        signal_sd_mount_failure_and_sleep();
     }
 
-    system_config_defaults_t defaults = build_system_config_defaults();
-    ret = system_config_ensure(APP_CONFIG_MOUNT_POINT, &defaults, TAG);
+    ret = load_runtime_config_at_mount(initial_mount_point);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Falha preparando configs do SD: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Falha lendo configs do SD: %s", esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
 
+    if (strcmp(s_runtime_config.sd_mount_point, initial_mount_point) != 0) {
+        char configured_mount[SYSTEM_CONFIG_MOUNT_POINT_LEN];
+        ret = copy_path_checked(configured_mount, sizeof(configured_mount), s_runtime_config.sd_mount_point);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Mount point de config inválido: %s", esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            esp_restart();
+        }
+
+        ESP_LOGI(TAG, "Remontando SD conforme config: %s", configured_mount);
+        sdcard_manager_unmount(TAG, &sys_status.sd_mounted);
+        ret = sdcard_manager_mount_sdspi(TAG,
+                                         APP_CONFIG_SD_PIN_MOSI,
+                                         APP_CONFIG_SD_PIN_MISO,
+                                         APP_CONFIG_SD_PIN_CLK,
+                                         APP_CONFIG_SD_PIN_CS,
+                                         configured_mount,
+                                         &sys_status.sd_mounted);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Falha remount SD em %s: %s", configured_mount, esp_err_to_name(ret));
+            signal_sd_mount_failure_and_sleep();
+        }
+
+        ret = load_runtime_config_at_mount(configured_mount);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Falha relendo configs em %s: %s", configured_mount, esp_err_to_name(ret));
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            esp_restart();
+        }
+    }
+
+    ret = copy_path_checked(s_active_sd_mount_point, sizeof(s_active_sd_mount_point), s_runtime_config.sd_mount_point);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha salvando mount point ativo: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
+    ret = build_music_root_path(&s_runtime_config, s_music_root_path, sizeof(s_music_root_path));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Falha montando caminho de músicas: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
+    ret = ensure_music_root_exists(s_music_root_path);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Diretório de músicas inválido: %s", s_music_root_path);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
+    apply_runtime_config();
     return ret;
 }
 
@@ -219,7 +379,7 @@ static esp_err_t start_input_task(void (*on_power_hold)(bool), const char *task_
         .double_click_interval_ms = APP_CONFIG_DOUBLE_CLICK_INTERVAL_MS,
         .long_click_threshold_ms = APP_CONFIG_LONG_CLICK_THRESHOLD_MS,
         .power_hold_ms = APP_CONFIG_POWER_HOLD_MS,
-        .volume_step = APP_CONFIG_VOLUME_STEP,
+        .volume_step = s_runtime_config.volume_step,
         .volume_percent = &current_volume,
         .volume_scale = &volume_scale,
         .log_tag = TAG,
@@ -248,8 +408,6 @@ static void start_wifi_ap_mode(void)
 {
     ESP_LOGW(TAG, "Modo WiFi AP ativo; Bluetooth/audio não serão inicializados");
 
-    mount_sd_or_restart();
-
     esp_err_t ret = start_input_task(enter_deep_sleep_minimal, "input_wifi");
     if (ret != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -259,11 +417,12 @@ static void start_wifi_ap_mode(void)
 
     ret = wifi_ap_manager_start(&(wifi_ap_manager_cfg_t){
         .tag = TAG,
-        .ssid = APP_CONFIG_WIFI_AP_SSID,
-        .password = APP_CONFIG_WIFI_AP_PASSWORD,
-        .mount_point = APP_CONFIG_MOUNT_POINT,
-        .channel = APP_CONFIG_WIFI_AP_CHANNEL,
-        .max_connections = APP_CONFIG_WIFI_AP_MAX_CONN,
+        .ssid = s_runtime_config.wifi_ssid,
+        .password = s_runtime_config.wifi_password,
+        .sd_mount_point = s_active_sd_mount_point,
+        .music_mount_point = s_music_root_path,
+        .channel = s_runtime_config.wifi_channel,
+        .max_connections = s_runtime_config.wifi_max_connections,
     });
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha modo WiFi AP: %s", esp_err_to_name(ret));
@@ -322,6 +481,11 @@ void app_main(void)
         return;
     }
 
+    ret = mount_sd_or_restart();
+    if (ret != ESP_OK) {
+        return;
+    }
+
     if (wifi_ap_enabled) {
         start_wifi_ap_mode();
         return;
@@ -333,12 +497,12 @@ void app_main(void)
         .connection_timer = &connection_timer,
         .discovery_timer = &discovery_timer,
         .buffer_monitor_timer = &buffer_monitor_timer,
-        .discovery_timeout_sec = APP_CONFIG_DISCOVERY_TIMEOUT_SEC,
+        .discovery_timeout_sec = s_runtime_config.discovery_timeout_sec,
         .pwr_release_wait_ms = APP_CONFIG_PWR_RELEASE_WAIT_MS,
-        .bt_connecting_stuck_ms = APP_CONFIG_BT_CONNECTING_STUCK_MS,
-        .auto_sleep_idle_ms = APP_CONFIG_AUTO_SLEEP_IDLE_MS,
+        .bt_connecting_stuck_ms = s_runtime_config.bt_connecting_stuck_ms,
+        .auto_sleep_idle_ms = s_runtime_config.auto_sleep_idle_ms,
         .a2dp_open_fail_rediscovery_threshold = APP_CONFIG_A2DP_OPEN_FAIL_REDISCOVERY_THRESHOLD,
-        .decode_stall_recovery_ms = APP_CONFIG_DECODE_STALL_RECOVERY_MS,
+        .decode_stall_recovery_ms = s_runtime_config.decode_stall_recovery_ms,
         .control_queue_len = 15,
         .sd_mounted = &sys_status.sd_mounted,
         .bt_initialized = &sys_status.bt_initialized,
@@ -362,6 +526,7 @@ void app_main(void)
         .a2dp_open_fail_streak = &a2dp_open_fail_streak,
         .target_device_addr = &target_device_addr,
         .target_mac_addr = &target_mac_addr,
+        .target_device_name = s_runtime_config.bt_device,
         .current_file = &current_file,
         .current_mp3_info = &current_mp3_info,
         .file_reader_task_handle = &file_reader_task_handle,
@@ -385,20 +550,20 @@ void app_main(void)
         .buffer_low_events = &buffer_low_events,
         .buffer_high_events = &buffer_high_events,
         .playback_paused = &playback_paused,
-        .stream_buffer_size = APP_CONFIG_STREAM_BUFFER_SIZE,
-        .stream_low_bytes = APP_CONFIG_STREAM_LOW_BYTES,
-        .stream_high_bytes = APP_CONFIG_STREAM_HIGH_BYTES,
+        .stream_buffer_size = s_runtime_config.stream_buffer_size,
+        .stream_low_bytes = (s_runtime_config.stream_buffer_size * s_runtime_config.stream_low_watermark_pct) / 100U,
+        .stream_high_bytes = (s_runtime_config.stream_buffer_size * s_runtime_config.stream_high_watermark_pct) / 100U,
         .mp3_input_buffer_size = APP_CONFIG_MP3_INPUT_BUFFER_SIZE,
         .pcm_output_buffer_size = APP_CONFIG_PCM_OUTPUT_BUFFER_SIZE,
         .prebuffer_frames = APP_CONFIG_PREBUFFER_FRAMES,
         .mp3_critical_bytes = APP_CONFIG_MP3_CRITICAL_BYTES,
-        .mp3_read_min = APP_CONFIG_MP3_READ_MIN,
-        .mp3_read_max = APP_CONFIG_MP3_READ_MAX,
+        .mp3_read_min = s_runtime_config.mp3_read_min,
+        .mp3_read_max = s_runtime_config.mp3_read_max,
         .mp3_no_sync_drop_bytes = APP_CONFIG_MP3_NO_SYNC_DROP_BYTES,
         .power_pin = APP_CONFIG_POWER_WAKE_PIN,
         .board_led_gpio = APP_CONFIG_BOARD_LED_GPIO,
         .board_led_active_high = APP_CONFIG_BOARD_LED_ACTIVE_HIGH,
-        .mount_point = APP_CONFIG_MOUNT_POINT,
+        .mount_point = s_music_root_path,
         .max_path_len = 256,
         .bt_connected_bit = BT_CONNECTED_BIT,
         .track_finished_bit = TRACK_FINISHED_BIT,
@@ -420,30 +585,23 @@ void app_main(void)
     }
     
     ESP_LOGI(TAG, "Estruturas criadas");
-    
-    ret = mount_sd_or_restart();
-    if (ret != ESP_OK) {
-        return;
-    }
-    
-    ret = media_count_mp3_files(APP_CONFIG_MOUNT_POINT, &mp3_count, TAG);
+
+    ret = media_count_mp3_files(s_music_root_path, &mp3_count, TAG);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha escanear MP3s: %s", esp_err_to_name(ret));
-        if (ret == ESP_ERR_NOT_FOUND) {
-            ESP_LOGE(TAG, "Nenhum MP3 encontrado!");
-            while (1) {
-                vTaskDelay(pdMS_TO_TICKS(10000));
-                ESP_LOGE(TAG, "Aguardando arquivos MP3...");
-            }
-        }
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
         return;
     }
+
+    if (mp3_count == 0) {
+        current_track = 0;
+        ESP_LOGW(TAG, "Nenhum MP3 encontrado; seguindo em IDLE sem travar");
+    }
     
     ret = app_facade_init_audio_buffers(APP_CONFIG_MP3_INPUT_BUFFER_SIZE,
                                         APP_CONFIG_PCM_OUTPUT_BUFFER_SIZE,
-                                        APP_CONFIG_STREAM_BUFFER_SIZE);
+                                        s_runtime_config.stream_buffer_size);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha buffers: %s", esp_err_to_name(ret));
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -494,7 +652,7 @@ void app_main(void)
     
     xTimerStart(buffer_monitor_timer, 0);
     
-    ESP_LOGI(TAG, "Iniciando busca BT: %s", APP_CONFIG_TARGET_DEVICE_NAME);
+    ESP_LOGI(TAG, "Iniciando busca BT: %s", s_runtime_config.bt_device);
     ret = app_facade_bluetooth_search_and_connect();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Falha busca: %s", esp_err_to_name(ret));
@@ -508,7 +666,7 @@ void app_main(void)
     ESP_LOGI(TAG, "   MAC alvo: %02X:%02X:%02X:%02X:%02X:%02X",
             target_mac_addr[0], target_mac_addr[1], target_mac_addr[2],
             target_mac_addr[3], target_mac_addr[4], target_mac_addr[5]);
-    ESP_LOGI(TAG, "   Referência: '%s'", APP_CONFIG_TARGET_DEVICE_NAME);
+    ESP_LOGI(TAG, "   Referência: '%s'", s_runtime_config.bt_device);
     ESP_LOGI(TAG, "");
     
     TickType_t last_check = xTaskGetTickCount();

@@ -35,6 +35,11 @@ static bool ready(void)
            s_ctx->set_bt_connecting && s_ctx->enter_deep_sleep && s_ctx->log_bt_state;
 }
 
+static bool playlist_has_tracks(void)
+{
+    return s_ctx && s_ctx->mp3_count && *s_ctx->mp3_count > 0;
+}
+
 void player_tasks_control_task(void *pvParameter)
 {
     (void)pvParameter;
@@ -72,6 +77,12 @@ void player_tasks_control_task(void *pvParameter)
 
             switch (cmd) {
                 case CMD_PLAY_NEXT: {
+                    if (!playlist_has_tracks()) {
+                        ESP_LOGW(s_ctx->tag, "PLAY_NEXT ignorado: nenhum MP3 encontrado (IDLE)");
+                        play_next_from_track_finish_pending = false;
+                        break;
+                    }
+
                     if (!s_ctx->bt_ready_for_playback(*s_ctx->bt_connected, *s_ctx->streaming_active)) {
                         ESP_LOGW(s_ctx->tag, "⚠️ PLAY_NEXT ignorado (BT/stream não pronto)");
                         play_next_from_track_finish_pending = false;
@@ -110,6 +121,11 @@ void player_tasks_control_task(void *pvParameter)
                 }
 
                 case CMD_PLAY_PREV: {
+                    if (!playlist_has_tracks()) {
+                        ESP_LOGW(s_ctx->tag, "PLAY_PREV ignorado: nenhum MP3 encontrado (IDLE)");
+                        break;
+                    }
+
                     if (!s_ctx->bt_ready_for_playback(*s_ctx->bt_connected, *s_ctx->streaming_active)) {
                         ESP_LOGW(s_ctx->tag, "⚠️ PLAY_PREV ignorado (BT/stream não pronto)");
                         break;
@@ -264,6 +280,12 @@ void player_tasks_control_task(void *pvParameter)
         EventBits_t bits = xEventGroupGetBits(*s_ctx->player_event_group);
 
         if (bits & s_ctx->track_finished_bit) {
+            if (!playlist_has_tracks()) {
+                xEventGroupClearBits(*s_ctx->player_event_group, s_ctx->track_finished_bit);
+                ESP_LOGW(s_ctx->tag, "Track finalizada ignorada: biblioteca vazia (IDLE)");
+                continue;
+            }
+
             if (!s_ctx->bt_ready_for_playback(*s_ctx->bt_connected, *s_ctx->streaming_active)) {
                 ESP_LOGW(s_ctx->tag, "Track finalizada, aguardando BT pronto para avançar");
                 continue;
@@ -310,9 +332,13 @@ void player_tasks_main_task(void *pvParameter)
                                            false,
                                            pdMS_TO_TICKS(12000));
     if (!(bits & s_ctx->bt_connected_bit)) {
-        ESP_LOGW(s_ctx->tag, "Sem conexão inicial em 12s, mantendo retries contínuos...");
-        control_enqueue(CMD_RETRY_CONNECTION, s_ctx->tag);
-        ESP_LOGI(s_ctx->tag, "Sistema iniciado sem BT (modo reconexão contínua).");
+        if (playlist_has_tracks()) {
+            ESP_LOGW(s_ctx->tag, "Sem conexão inicial em 12s, mantendo retries contínuos...");
+            control_enqueue(CMD_RETRY_CONNECTION, s_ctx->tag);
+            ESP_LOGI(s_ctx->tag, "Sistema iniciado sem BT (modo reconexão contínua).");
+        } else {
+            ESP_LOGW(s_ctx->tag, "Sem conexão inicial em 12s e sem MP3; permanecendo em IDLE.");
+        }
     } else {
         ESP_LOGI(s_ctx->tag, "Bluetooth conectado! Sistema pronto.");
     }
@@ -335,10 +361,14 @@ void player_tasks_main_task(void *pvParameter)
         TickType_t now = xTaskGetTickCount();
 
         if (xTaskGetTickCount() - last_alive_log > pdMS_TO_TICKS(120000)) {
-            PERF_LOGI(s_ctx->tag,
-                      "Sistema ativo - Track: [%d/%d]",
-                      *s_ctx->current_track + 1,
-                      *s_ctx->mp3_count);
+            if (playlist_has_tracks()) {
+                PERF_LOGI(s_ctx->tag,
+                          "Sistema ativo - Track: [%d/%d]",
+                          *s_ctx->current_track + 1,
+                          *s_ctx->mp3_count);
+            } else {
+                PERF_LOGI(s_ctx->tag, "Sistema ativo - IDLE (nenhum MP3)");
+            }
             PERF_LOGI(s_ctx->tag,
                       "Stream: %s, Heap: %lu",
                       *s_ctx->streaming_active ? "ON" : "OFF",
@@ -370,11 +400,16 @@ void player_tasks_main_task(void *pvParameter)
             }
         }
 
-        if (!*s_ctx->bt_connected && !*s_ctx->audio_playing) {
+        bool no_tracks = !playlist_has_tracks();
+        bool idle_no_audio = !*s_ctx->audio_playing && (no_tracks || !*s_ctx->bt_connected);
+
+        if (idle_no_audio) {
             if (idle_without_bt_start == 0) {
                 idle_without_bt_start = xTaskGetTickCount();
             }
-            if (!*s_ctx->bt_connecting &&
+
+            if (!no_tracks &&
+                !*s_ctx->bt_connecting &&
                 !control_is_pending(CMD_RETRY_CONNECTION) &&
                 !control_is_pending(CMD_RESTART_DISCOVERY) &&
                 !control_is_pending(CMD_CONNECT_TARGET) &&
@@ -389,7 +424,7 @@ void player_tasks_main_task(void *pvParameter)
                 control_enqueue(CMD_RETRY_CONNECTION, s_ctx->tag);
             }
 
-            if (*s_ctx->bt_connecting && *s_ctx->bt_connecting_since != 0) {
+            if (!no_tracks && *s_ctx->bt_connecting && *s_ctx->bt_connecting_since != 0) {
                 TickType_t connecting_ticks = xTaskGetTickCount() - *s_ctx->bt_connecting_since;
                 if (connecting_ticks > pdMS_TO_TICKS(s_ctx->bt_connecting_stuck_ms)) {
                     ESP_LOGW(s_ctx->tag,
@@ -402,9 +437,15 @@ void player_tasks_main_task(void *pvParameter)
 
             TickType_t idle_ticks = xTaskGetTickCount() - idle_without_bt_start;
             if (idle_ticks > pdMS_TO_TICKS(s_ctx->auto_sleep_idle_ms)) {
-                ESP_LOGW(s_ctx->tag,
-                         "⏲️ Auto-sleep: %lu ms sem BT/áudio",
-                         (unsigned long)TICKS_TO_MS_LOCAL(idle_ticks));
+                if (no_tracks) {
+                    ESP_LOGW(s_ctx->tag,
+                             "⏲️ Auto-sleep: %lu ms em IDLE sem MP3",
+                             (unsigned long)TICKS_TO_MS_LOCAL(idle_ticks));
+                } else {
+                    ESP_LOGW(s_ctx->tag,
+                             "⏲️ Auto-sleep: %lu ms sem BT/áudio",
+                             (unsigned long)TICKS_TO_MS_LOCAL(idle_ticks));
+                }
                 s_ctx->enter_deep_sleep(false);
             }
         } else {

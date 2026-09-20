@@ -89,12 +89,12 @@ esp_err_t media_count_mp3_files(const char *mount_point, int *out_count, const c
 
     closedir(dir);
 
+    *out_count = count;
     if (count == 0) {
-        ESP_LOGE(tag, "Nenhum arquivo MP3 encontrado");
-        return ESP_ERR_NOT_FOUND;
+        ESP_LOGW(tag, "Nenhum arquivo MP3 encontrado");
+        return ESP_OK;
     }
 
-    *out_count = count;
     ESP_LOGI(tag, "Total: %d arquivos MP3 encontrados", count);
     return ESP_OK;
 }

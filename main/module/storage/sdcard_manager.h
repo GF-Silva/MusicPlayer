@@ -12,5 +12,6 @@ esp_err_t sdcard_manager_mount_sdspi(const char *tag,
                                      int pin_cs,
                                      const char *mount_point,
                                      bool *sd_mounted);
+esp_err_t sdcard_manager_unmount(const char *tag, bool *sd_mounted);
 
 #endif

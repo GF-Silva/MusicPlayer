@@ -22,6 +22,78 @@ static inline void enqueue_cmd(player_cmd_t cmd)
     }
 }
 
+static bool target_mac_configured(void)
+{
+    if (!s_ctx || !s_ctx->target_mac_addr) {
+        return false;
+    }
+
+    for (int i = 0; i < ESP_BD_ADDR_LEN; i++) {
+        if ((*s_ctx->target_mac_addr)[i] != 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool copy_eir_name(uint8_t *eir, char *name, size_t name_len)
+{
+    if (!eir || !name || name_len == 0) {
+        return false;
+    }
+
+    uint8_t remote_name_len = 0;
+    uint8_t *remote_name = esp_bt_gap_resolve_eir_data(eir,
+                                                       ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME,
+                                                       &remote_name_len);
+    if (!remote_name) {
+        remote_name = esp_bt_gap_resolve_eir_data(eir,
+                                                  ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME,
+                                                  &remote_name_len);
+    }
+
+    if (!remote_name || remote_name_len == 0) {
+        return false;
+    }
+
+    size_t copy_len = remote_name_len;
+    if (copy_len >= name_len) {
+        copy_len = name_len - 1;
+    }
+    memcpy(name, remote_name, copy_len);
+    name[copy_len] = '\0';
+    return true;
+}
+
+static bool copy_remote_name(const esp_bt_gap_cb_param_t *param, char *name, size_t name_len)
+{
+    if (!param || !name || name_len == 0) {
+        return false;
+    }
+
+    name[0] = '\0';
+    for (int i = 0; i < param->disc_res.num_prop; i++) {
+        esp_bt_gap_dev_prop_t *prop = param->disc_res.prop + i;
+        if (prop->type == ESP_BT_GAP_DEV_PROP_BDNAME && prop->len > 0 && prop->val) {
+            size_t copy_len = (size_t)prop->len;
+            if (copy_len >= name_len) {
+                copy_len = name_len - 1;
+            }
+            memcpy(name, prop->val, copy_len);
+            name[copy_len] = '\0';
+            return true;
+        }
+
+        if (prop->type == ESP_BT_GAP_DEV_PROP_EIR && prop->len > 0 && prop->val &&
+            copy_eir_name((uint8_t *)prop->val, name, name_len)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void bt_callbacks_bind(bt_callbacks_ctx_t *ctx)
 {
     s_ctx = ctx;
@@ -77,20 +149,30 @@ void bt_callbacks_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *par
                      param->disc_res.bda[4],
                      param->disc_res.bda[5]);
 
-            bool mac_match = false;
-            if (s_ctx->target_mac_addr &&
-                ((*s_ctx->target_mac_addr)[0] != 0 || (*s_ctx->target_mac_addr)[1] != 0 ||
-                 (*s_ctx->target_mac_addr)[2] != 0) &&
-                memcmp(param->disc_res.bda, *s_ctx->target_mac_addr, ESP_BD_ADDR_LEN) == 0) {
-                mac_match = true;
+            bool mac_enabled = target_mac_configured();
+            bool mac_match = mac_enabled &&
+                             memcmp(param->disc_res.bda, *s_ctx->target_mac_addr, ESP_BD_ADDR_LEN) == 0;
+            char remote_name[64];
+            bool has_name = copy_remote_name(param, remote_name, sizeof(remote_name));
+            bool name_match = !mac_enabled &&
+                              has_name &&
+                              s_ctx->target_device_name &&
+                              s_ctx->target_device_name[0] != '\0' &&
+                              strstr(remote_name, s_ctx->target_device_name) != NULL;
+
+            if (has_name) {
+                ESP_LOGD(s_ctx->tag, "BT encontrado: %s [%s]", remote_name, bda_str);
             }
 
-            if (mac_match && !*s_ctx->device_found) {
+            if ((mac_match || name_match) && !*s_ctx->device_found) {
                 *s_ctx->device_found = true;
                 memcpy(*s_ctx->target_device_addr, param->disc_res.bda, ESP_BD_ADDR_LEN);
 
-                ESP_LOGI(s_ctx->tag, "✅ Dispositivo encontrado por MAC!");
+                ESP_LOGI(s_ctx->tag, "✅ Dispositivo encontrado por %s!", mac_match ? "MAC" : "nome");
                 ESP_LOGI(s_ctx->tag, "   MAC: %s", bda_str);
+                if (has_name) {
+                    ESP_LOGI(s_ctx->tag, "   Nome: %s", remote_name);
+                }
 
                 if (s_ctx->discovery_timer && *s_ctx->discovery_timer) {
                     xTimerStop(*s_ctx->discovery_timer, 0);
