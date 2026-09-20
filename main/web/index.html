@@ -363,6 +363,10 @@
 
       /* ── FILE INPUT ── */
       .file-drop {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
         width: 100%;
         padding: 16px;
         border: 1.5px dashed var(--border);
@@ -939,7 +943,7 @@
       async function loadConfig() {
         setStatus('Carregando config…');
         try {
-          const res = await fetch('/get-configs', { cache: 'no-store' });
+          const res = await fetch('/configs', { cache: 'no-store' });
           if (!res.ok) throw new Error(await res.text());
           configEditorEl.value = JSON.stringify(await res.json(), null, 2);
           setStatus('Config carregada', 'ok');
@@ -994,7 +998,7 @@
       async function loadErrors() {
         setStatus('Carregando erros…');
         try {
-          const res = await fetch('/get-errors', { cache: 'no-store' });
+          const res = await fetch('/errors', { cache: 'no-store' });
           if (!res.ok) throw new Error(await res.text());
           errorLogEl.textContent = (await res.text()) || 'Sem erros registrados.';
           setStatus('Erros carregados', 'ok');

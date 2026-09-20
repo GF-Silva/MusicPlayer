@@ -72,12 +72,12 @@ O diretório `.system` e reservado pelo firmware para os arquivos internos e nao
 
 Depois de reiniciar, o firmware consome os valores do arquivo para Wi-Fi AP, Bluetooth, volume, buffers de audio, timeouts de runtime e diretorio de musicas.
 
-## GET /get-configs
+## GET /configs
 
 Retorna o conteudo de `/.system/config.json` em stream.
 
 ```http
-GET /get-configs
+GET /configs
 Accept: application/json
 ```
 
@@ -110,12 +110,12 @@ Resposta:
 
 Alias de atualizacao registrado para o frontend/API. No firmware atual, ele tem o mesmo comportamento de `PUT /configs`: valida o corpo como JSON e substitui o arquivo inteiro.
 
-## GET /get-errors
+## GET /errors
 
 Retorna `/.system/errors.log` como NDJSON em stream.
 
 ```http
-GET /get-errors
+GET /errors
 Accept: application/x-ndjson
 ```
 
@@ -130,7 +130,7 @@ Cada linha segue:
 A primeira tela mostra tres rotas de administracao:
 
 - `Musicas`: consome `GET /musics`, `PUT /musics?nome=...` e `DELETE /musics?nome=...`;
-- `Configs`: consome `GET /get-configs` e `PUT /configs`;
-- `Erros`: consome `GET /get-errors`.
+- `Configs`: consome `GET /configs` e `PUT /configs`;
+- `Erros`: consome `GET /errors`.
 
 Uploads e remocoes de multiplas musicas sao executados pelo frontend como fila sequencial, sempre uma musica por request.

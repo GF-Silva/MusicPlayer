@@ -975,7 +975,7 @@ static esp_err_t start_http_server(void)
         .handler = status_get_handler,
     };
     const httpd_uri_t get_configs = {
-        .uri = "/get-configs",
+        .uri = "/configs",
         .method = HTTP_GET,
         .handler = get_configs_handler,
     };
@@ -990,7 +990,7 @@ static esp_err_t start_http_server(void)
         .handler = update_configs_handler,
     };
     const httpd_uri_t get_errors = {
-        .uri = "/get-errors",
+        .uri = "/errors",
         .method = HTTP_GET,
         .handler = get_errors_handler,
     };
@@ -1025,7 +1025,7 @@ static esp_err_t start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &get_musics));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &delete_music));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &stream));
-
+    
     return ESP_OK;
 }
 
