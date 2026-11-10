@@ -1,4 +1,4 @@
-idF_component_register(
+idf_component_register(
     SRCS
         "main.c"
         "module/audio/ring_buffer.c"

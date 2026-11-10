@@ -1,7 +1,7 @@
 #include "memory_metrics.h"
 
 #include "esp_log.h"
-#include "esp_system.h"
+#include "freertos/task.h"
 
 memory_metrics_snapshot_t memory_metrics_take_snapshot(void)
 {
@@ -19,13 +19,13 @@ void memory_metrics_log_snapshot(const char *tag, const char *label)
 {
     memory_metrics_snapshot_t s = memory_metrics_take_snapshot();
     ESP_LOGI(tag,
-             "MEM[%s] free8=%u min8=%u largest8=%u free_internal=%u largest_internal=%u",
+             "MEM[%s] free8=%zu min8=%zu largest8=%zu free_internal=%zu largest_internal=%zu",
              label ? label : "snapshot",
-             (unsigned)s.free_8bit,
-             (unsigned)s.min_free_8bit,
-             (unsigned)s.largest_8bit,
-             (unsigned)s.free_internal,
-             (unsigned)s.largest_internal);
+             s.free_8bit,
+             s.min_free_8bit,
+             s.largest_8bit,
+             s.free_internal,
+             s.largest_internal);
 }
 
 void memory_metrics_log_delta(const char *tag,
@@ -40,12 +40,19 @@ void memory_metrics_log_delta(const char *tag,
     long delta_8bit = (long)before->free_8bit - (long)after.free_8bit;
     long delta_internal = (long)before->free_internal - (long)after.free_internal;
     ESP_LOGI(tag,
-             "MEM[%s] delta8=%ld delta_internal=%ld free8=%u largest8=%u free_internal=%u largest_internal=%u",
+             "MEM[%s] delta8=%ld delta_internal=%ld free8=%zu largest8=%zu free_internal=%zu largest_internal=%zu",
              label ? label : "delta",
              delta_8bit,
              delta_internal,
-             (unsigned)after.free_8bit,
-             (unsigned)after.largest_8bit,
-             (unsigned)after.free_internal,
-             (unsigned)after.largest_internal);
+             after.free_8bit,
+             after.largest_8bit,
+             after.free_internal,
+             after.largest_internal);
+}
+
+void memory_metrics_log_current_task_stack(const char *tag, const char *label)
+{
+    /* ESP-IDF reports this high-water mark in bytes. */
+    UBaseType_t minimum_free = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(tag, "MEM[stack:%s] minimum_free=%u bytes", label ? label : "current", (unsigned)minimum_free);
 }

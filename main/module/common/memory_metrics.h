@@ -22,6 +22,7 @@ void memory_metrics_log_snapshot(const char *tag, const char *label);
 void memory_metrics_log_delta(const char *tag,
                               const char *label,
                               const memory_metrics_snapshot_t *before);
+void memory_metrics_log_current_task_stack(const char *tag, const char *label);
 
 #ifdef __cplusplus
 }
