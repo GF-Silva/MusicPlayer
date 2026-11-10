@@ -1,4 +1,4 @@
-idf_component_register(
+idF_component_register(
     SRCS
         "main.c"
         "module/audio/ring_buffer.c"
@@ -20,6 +20,7 @@ idf_component_register(
         "module/system/app_mode.c"
         "module/system/system_config_manager.c"
         "module/wifi/wifi_ap_manager.c"
+        "module/common/memory_metrics.c"
     INCLUDE_DIRS
         "."
         "module/audio"
@@ -35,7 +36,7 @@ idf_component_register(
         "module/wifi"
     EMBED_FILES
         "web/index.html"
-    REQUIRES 
+    REQUIRES
         bt
         esp_http_server
         esp_netif
